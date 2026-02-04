@@ -2461,6 +2461,210 @@ find_idt_base(int sock, uint64_t *idt_base_out)
 #undef IDT_CONFIRM_MIN
 
 /*
+ * idt_diag - Diagnostic scan to understand why IDT discovery fails.
+ *
+ * Scans 64MB from DATA_BASE with relaxed criteria (no selector or handler
+ * range checks) to find any gate-descriptor-like patterns. Reports:
+ *   - How many chunks are readable vs zero-filled
+ *   - Total individual gate-like entries found (present + type 14/15 + reserved=0)
+ *   - Candidate locations where 3+ consecutive entries match relaxed criteria
+ *   - Selector values and handler addresses at each candidate
+ *
+ * This reveals whether the IDT uses a different selector, handlers point
+ * outside the expected range, or the IDT is beyond the normal scan range.
+ */
+static void
+cmd_idt_diag(int sock)
+{
+    uint64_t kdata_base = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+    uint64_t ktext_base = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
+    uint64_t scan_range = 0x4000000; /* 64MB */
+    int total_chunks = scan_range / 4096;
+    uint8_t buf[4096];
+
+    send_response(sock, "=== IDT Diagnostic Scan ===\n");
+    send_response(sock, "DATA_BASE: 0x%lx\n", kdata_base);
+    send_response(sock, "TEXT_BASE: 0x%lx\n", ktext_base);
+    send_response(sock, "Scan range: %luMB (%d chunks)\n\n",
+                  (unsigned long)(scan_range / (1024 * 1024)), total_chunks);
+
+    int readable_chunks = 0;
+    int zero_chunks = 0;
+    int total_gate_like = 0; /* individual entries matching relaxed criteria */
+
+    /* Selector histogram: track most common selectors in gate-like entries */
+    #define DIAG_SEL_HIST 16
+    struct { uint16_t sel; int count; } sel_hist[DIAG_SEL_HIST];
+    int num_sels = 0;
+
+    /* Candidates: page-aligned locations with 3+ consecutive relaxed gates */
+    #define MAX_DIAG_CANDIDATES 32
+    struct {
+        uint64_t addr;
+        int relaxed_count;  /* of first 4 entries */
+        int strict_count;   /* of first 4 entries (with sel=0x20 + handler check) */
+        uint16_t selectors[4];
+        uint64_t handlers[4];
+        uint8_t types[4];
+        uint8_t present[4];
+    } cands[MAX_DIAG_CANDIDATES];
+    int num_cands = 0;
+
+    for (int chunk = 0; chunk < total_chunks; chunk++) {
+        uint64_t addr = kdata_base + (uint64_t)chunk * 4096;
+
+        if (chunk % 4096 == 0)
+            send_response(sock, "  ...%d/%d chunks (%luMB)\n",
+                          chunk, total_chunks,
+                          (unsigned long)((uint64_t)chunk * 4096 / (1024 * 1024)));
+
+        if (kernel_copyout(addr, buf, sizeof(buf)) != 0)
+            continue;
+        readable_chunks++;
+
+        /* Check if first 64 bytes all zero (quick skip) */
+        int all_zero = 1;
+        for (int i = 0; i < 64; i++) {
+            if (buf[i] != 0) { all_zero = 0; break; }
+        }
+        if (all_zero) { zero_chunks++; continue; }
+
+        /* Check first 4 entries (page-aligned) with relaxed criteria */
+        int relaxed = 0, strict = 0;
+        uint16_t sels[4];
+        uint64_t hdlrs[4];
+        uint8_t types[4], pres[4];
+
+        for (int e = 0; e < 4; e++) {
+            uint8_t *entry = buf + e * 16;
+            pres[e]  = (entry[5] >> 7) & 1;
+            types[e] = entry[5] & 0x0F;
+
+            uint32_t reserved;
+            memcpy(&reserved, entry + 12, 4);
+            memcpy(&sels[e], entry + 2, 2);
+
+            uint16_t off_low, off_mid;
+            uint32_t off_high;
+            memcpy(&off_low, entry + 0, 2);
+            memcpy(&off_mid, entry + 6, 2);
+            memcpy(&off_high, entry + 8, 4);
+            hdlrs[e] = (uint64_t)off_low |
+                        ((uint64_t)off_mid << 16) |
+                        ((uint64_t)off_high << 32);
+
+            /* Relaxed: present=1, type=14|15, reserved=0 */
+            if (pres[e] == 1 && (types[e] == 14 || types[e] == 15) &&
+                reserved == 0) {
+                relaxed++;
+                total_gate_like++;
+
+                /* Track selector in histogram */
+                int found_sel = 0;
+                for (int s = 0; s < num_sels; s++) {
+                    if (sel_hist[s].sel == sels[e]) {
+                        sel_hist[s].count++;
+                        found_sel = 1;
+                        break;
+                    }
+                }
+                if (!found_sel && num_sels < DIAG_SEL_HIST) {
+                    sel_hist[num_sels].sel = sels[e];
+                    sel_hist[num_sels].count = 1;
+                    num_sels++;
+                }
+
+                /* Strict: also sel=0x20 and handler in text range */
+                if (sels[e] == 0x0020 &&
+                    hdlrs[e] >= ktext_base &&
+                    hdlrs[e] < ktext_base + 0x2000000)
+                    strict++;
+            }
+        }
+
+        if (relaxed >= 3 && num_cands < MAX_DIAG_CANDIDATES) {
+            cands[num_cands].addr = addr;
+            cands[num_cands].relaxed_count = relaxed;
+            cands[num_cands].strict_count = strict;
+            memcpy(cands[num_cands].selectors, sels, sizeof(sels));
+            memcpy(cands[num_cands].handlers, hdlrs, sizeof(hdlrs));
+            memcpy(cands[num_cands].types, types, sizeof(types));
+            memcpy(cands[num_cands].present, pres, sizeof(pres));
+            num_cands++;
+        }
+
+        /* Also scan all 256 entries in chunk for gate-like count */
+        for (int e = 4; e < 256; e++) {
+            uint8_t *entry = buf + e * 16;
+            uint8_t p = (entry[5] >> 7) & 1;
+            uint8_t t = entry[5] & 0x0F;
+            uint32_t reserved;
+            memcpy(&reserved, entry + 12, 4);
+            if (p == 1 && (t == 14 || t == 15) && reserved == 0) {
+                total_gate_like++;
+                int found_sel = 0;
+                uint16_t s;
+                memcpy(&s, entry + 2, 2);
+                for (int si = 0; si < num_sels; si++) {
+                    if (sel_hist[si].sel == s) {
+                        sel_hist[si].count++;
+                        found_sel = 1;
+                        break;
+                    }
+                }
+                if (!found_sel && num_sels < DIAG_SEL_HIST) {
+                    sel_hist[num_sels].sel = s;
+                    sel_hist[num_sels].count = 1;
+                    num_sels++;
+                }
+            }
+        }
+    }
+
+    /* Report results */
+    send_response(sock, "\n--- Scan Statistics ---\n");
+    send_response(sock, "Total chunks: %d\n", total_chunks);
+    send_response(sock, "Readable:     %d\n", readable_chunks);
+    send_response(sock, "Zero-filled:  %d (first 64 bytes zero)\n", zero_chunks);
+    send_response(sock, "Total gate-like entries (relaxed): %d\n\n", total_gate_like);
+
+    /* Selector histogram */
+    send_response(sock, "--- Selector Histogram ---\n");
+    if (num_sels == 0) {
+        send_response(sock, "  (no gate-like entries found at all)\n");
+    } else {
+        for (int i = 0; i < num_sels; i++)
+            send_response(sock, "  sel=0x%04x : %d entries\n",
+                          sel_hist[i].sel, sel_hist[i].count);
+    }
+
+    /* Candidates */
+    send_response(sock, "\n--- Candidates (3+ relaxed matches at page boundary) ---\n");
+    if (num_cands == 0) {
+        send_response(sock, "  (none found)\n");
+    } else {
+        for (int i = 0; i < num_cands; i++) {
+            send_response(sock, "\nCandidate %d: 0x%lx  (relaxed=%d strict=%d)\n",
+                          i, cands[i].addr,
+                          cands[i].relaxed_count, cands[i].strict_count);
+            for (int e = 0; e < 4; e++) {
+                send_response(sock,
+                    "  [%d] p=%d type=%2d sel=0x%04x handler=0x%016lx",
+                    e, cands[i].present[e], cands[i].types[e],
+                    cands[i].selectors[e], cands[i].handlers[e]);
+                if (cands[i].handlers[e] >= ktext_base &&
+                    cands[i].handlers[e] < ktext_base + 0x4000000)
+                    send_response(sock, " [ktext+0x%lx]",
+                                  cands[i].handlers[e] - ktext_base);
+                send_response(sock, "\n");
+            }
+        }
+    }
+
+    send_response(sock, "\nOK\n");
+}
+
+/*
  * dump_idt - Discover and parse the Interrupt Descriptor Table
  *
  * Finds the IDT by scanning .data/.bss for valid gate descriptor patterns,
@@ -3245,6 +3449,8 @@ handle_command(int sock, char *cmd) {
         cmd_analyze_apic_ops(sock, cmd + 17);
     } else if (strcmp(cmd, "find_cfi_targets") == 0) {
         cmd_find_cfi_targets(sock);
+    } else if (strcmp(cmd, "idt_diag") == 0) {
+        cmd_idt_diag(sock);
     } else if (strcmp(cmd, "dump_idt") == 0) {
         cmd_dump_idt(sock);
     } else if (strcmp(cmd, "find_doreti_iret") == 0) {
@@ -3280,6 +3486,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "identify_table <off> [ctx] - Identify func ptr table (kdata offset)\n");
         send_response(sock, "analyze_apic_ops <off>   - Full apic_ops analysis (36 entries)\n");
         send_response(sock, "find_cfi_targets         - Find CFI-valid function targets\n");
+        send_response(sock, "idt_diag                 - IDT diagnostic (relaxed gate scan, 64MB)\n");
         send_response(sock, "dump_idt                 - Dump IDT (handlers, IST, types)\n");
         send_response(sock, "find_doreti_iret         - Find doreti_iret gadget in kernel .text\n");
         send_response(sock, "\nexit                     - Close connection\n");
