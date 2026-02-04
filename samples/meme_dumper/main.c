@@ -2252,6 +2252,249 @@ cmd_find_cfi_targets(int sock)
     send_response(sock, "OK\n");
 }
 
+/*
+ * dump_idt - Discover and parse the Interrupt Descriptor Table
+ *
+ * Finds the IDT via SIDT instruction (or .data scan if UMIP blocks it),
+ * reads all 256 gate descriptors, and displays handler addresses, IST
+ * assignments, and gate types. Key output for singlestep primitive:
+ * #DB (vec 1) and #GP (vec 13) handler addresses and IST indices.
+ */
+static void
+cmd_dump_idt(int sock)
+{
+    intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    uint64_t text_start = (uint64_t)ktext_base;
+    uint64_t text_end = text_start + 0x1000000;
+
+    uint64_t idt_base = 0;
+    int found_idt = 0;
+
+    send_response(sock, "=== IDT Discovery ===\n\n");
+
+    /* Method 1: SIDT instruction (may fault if UMIP enabled) */
+    send_response(sock, "--- Method 1: SIDT instruction ---\n");
+    {
+        struct sigaction sa, old_segv, old_bus, old_ill;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = probe_signal_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGSEGV, &sa, &old_segv);
+        sigaction(SIGBUS, &sa, &old_bus);
+        sigaction(SIGILL, &sa, &old_ill);
+
+        probe_fault_occurred = 0;
+        if (sigsetjmp(probe_jmp_env, 1) == 0) {
+            struct {
+                uint16_t limit;
+                uint64_t base;
+            } __attribute__((packed)) idtr;
+            __asm__ __volatile__("sidt %0" : "=m"(idtr));
+            idt_base = idtr.base;
+            found_idt = 1;
+            send_response(sock, "  base=0x%lx  limit=0x%x (%d entries)\n",
+                          idtr.base, idtr.limit, (idtr.limit + 1) / 16);
+        } else {
+            send_response(sock, "  SIDT faulted (UMIP likely enabled)\n");
+        }
+
+        sigaction(SIGSEGV, &old_segv, NULL);
+        sigaction(SIGBUS, &old_bus, NULL);
+        sigaction(SIGILL, &old_ill, NULL);
+    }
+
+    /* Method 2: Scan .data for cached IDTR (limit=0x0FFF + kernel VA) */
+    if (!found_idt) {
+        send_response(sock, "\n--- Method 2: Scan .data for IDTR ---\n");
+        uint8_t buf[4096];
+        uint64_t scan_end = (uint64_t)kdata_base + 0x1000000;
+
+        for (uint64_t addr = (uint64_t)kdata_base;
+             addr < scan_end && !found_idt; addr += sizeof(buf)) {
+            if (kernel_copyout(addr, buf, sizeof(buf)) != 0)
+                continue;
+            for (int i = 0; i <= (int)sizeof(buf) - 10; i += 2) {
+                uint16_t limit;
+                uint64_t base;
+                memcpy(&limit, buf + i, 2);
+                memcpy(&base, buf + i + 2, 8);
+
+                if (limit != 0x0FFF)
+                    continue;
+                /* Check if base looks like a kernel VA */
+                if ((base >> 40) != 0xFFFFFF)
+                    continue;
+
+                /* Validate: read first IDT entry at this base */
+                uint8_t entry[16];
+                if (kernel_copyout(base, entry, 16) != 0)
+                    continue;
+                uint8_t p = (entry[5] >> 7) & 1;
+                uint8_t type = entry[5] & 0x0F;
+                uint16_t sel;
+                memcpy(&sel, entry + 2, 2);
+
+                if (p == 1 && (type == 14 || type == 15) && sel == 0x20) {
+                    idt_base = base;
+                    found_idt = 1;
+                    send_response(sock, "  Found IDTR at kdata+0x%lx: base=0x%lx\n",
+                                  (addr + i) - (uint64_t)kdata_base, base);
+                    break;
+                }
+            }
+        }
+        if (!found_idt)
+            send_response(sock, "  IDTR not found in .data scan\n");
+    }
+
+    if (!found_idt) {
+        send_response(sock, "\nERROR: Could not locate IDT\n");
+        send_response(sock, "OK\n");
+        return;
+    }
+
+    /* Read full IDT: 256 entries × 16 bytes = 4096 bytes */
+    uint8_t idt[4096];
+    if (kernel_copyout(idt_base, idt, sizeof(idt)) != 0) {
+        send_response(sock, "ERROR: Failed to read IDT at 0x%lx\n", idt_base);
+        send_response(sock, "OK\n");
+        return;
+    }
+
+    /* Vector name table */
+    static const char *vec_name[256] = {
+        [0]  = "#DE Divide",
+        [1]  = "#DB Debug ***",
+        [2]  = "NMI",
+        [3]  = "#BP Breakpoint",
+        [4]  = "#OF Overflow",
+        [5]  = "#BR Bound",
+        [6]  = "#UD InvalidOp",
+        [7]  = "#NM NoMath",
+        [8]  = "#DF DoubleFault",
+        [9]  = "CoprocOverrun",
+        [10] = "#TS InvalidTSS",
+        [11] = "#NP SegNotPres",
+        [12] = "#SS StackFault",
+        [13] = "#GP GenProt ***",
+        [14] = "#PF PageFault",
+        [16] = "#MF x87FPU",
+        [17] = "#AC AlignChk",
+        [18] = "#MC MachineChk",
+        [19] = "#XF SIMD",
+        [0x80] = "Syscall"
+    };
+
+    send_response(sock, "\n--- IDT Entries ---\n");
+    send_response(sock, "Vec  Name             Handler              Sel  IST Type DPL\n");
+    send_response(sock, "---- ---------------- -------------------- ---- --- ---- ---\n");
+
+    int text_count = 0, present_count = 0;
+    int ist_vectors[8][16]; /* ist_vectors[ist][n] = vector numbers */
+    int ist_counts[8] = {0};
+
+    for (int v = 0; v < 256; v++) {
+        uint8_t *e = idt + v * 16;
+
+        uint16_t off_low, off_mid, sel;
+        uint32_t off_high;
+        memcpy(&off_low, e + 0, 2);
+        memcpy(&sel, e + 2, 2);
+        memcpy(&off_mid, e + 6, 2);
+        memcpy(&off_high, e + 8, 4);
+
+        uint8_t ist  = e[4] & 0x07;
+        uint8_t type = e[5] & 0x0F;
+        uint8_t dpl  = (e[5] >> 5) & 0x03;
+        uint8_t p    = (e[5] >> 7) & 0x01;
+
+        uint64_t handler = (uint64_t)off_low |
+                           ((uint64_t)off_mid << 16) |
+                           ((uint64_t)off_high << 32);
+
+        if (p) present_count++;
+        if (p && handler >= text_start && handler < text_end)
+            text_count++;
+
+        if (ist > 0 && ist < 8 && ist_counts[ist] < 16)
+            ist_vectors[ist][ist_counts[ist]++] = v;
+
+        /* Show: first 20 vectors, syscall, anything with IST, or *** vectors */
+        int show = (v < 20) || (v == 0x80) || (ist > 0 && p);
+        if (!show) continue;
+
+        const char *name = vec_name[v] ? vec_name[v] : "";
+        const char *tname = (type == 14) ? "IntG" :
+                            (type == 15) ? "TrpG" : "????";
+
+        if (!p) {
+            send_response(sock, "%3d  %-16s (not present)\n", v, name);
+        } else if (handler >= text_start && handler < text_end) {
+            send_response(sock, "%3d  %-16s ktext+0x%-12lx 0x%02x  %d  %s  %d\n",
+                          v, name, handler - text_start, sel, ist, tname, dpl);
+        } else {
+            send_response(sock, "%3d  %-16s 0x%016lx 0x%02x  %d  %s  %d\n",
+                          v, name, handler, sel, ist, tname, dpl);
+        }
+    }
+
+    /* Summary */
+    send_response(sock, "\n--- Summary ---\n");
+    send_response(sock, "IDT base: 0x%lx\n", idt_base);
+    send_response(sock, "Present: %d/256    .text handlers: %d\n",
+                  present_count, text_count);
+
+    /* IST assignments */
+    send_response(sock, "\n--- IST Assignments ---\n");
+    int any_ist = 0;
+    for (int i = 1; i < 8; i++) {
+        if (ist_counts[i] > 0) {
+            any_ist = 1;
+            send_response(sock, "  IST%d: ", i);
+            for (int j = 0; j < ist_counts[i]; j++) {
+                if (j > 0) send_response(sock, ", ");
+                send_response(sock, "vec %d", ist_vectors[i][j]);
+                if (vec_name[ist_vectors[i][j]])
+                    send_response(sock, " (%s)", vec_name[ist_vectors[i][j]]);
+            }
+            send_response(sock, "\n");
+        }
+    }
+    if (!any_ist)
+        send_response(sock, "  (no IST assignments found)\n");
+
+    /* Key vectors for singlestep primitive */
+    send_response(sock, "\n--- Singlestep Prerequisites ---\n");
+
+    for (int vec = 0; vec < 2; vec++) {
+        int v = (vec == 0) ? 1 : 13; /* #DB, #GP */
+        uint8_t *e = idt + v * 16;
+        uint16_t ol, om;
+        uint32_t oh;
+        memcpy(&ol, e + 0, 2);
+        memcpy(&om, e + 6, 2);
+        memcpy(&oh, e + 8, 4);
+        uint64_t h = (uint64_t)ol | ((uint64_t)om << 16) | ((uint64_t)oh << 32);
+        uint8_t ist = e[4] & 0x07;
+        const char *label = (v == 1) ? "#DB (debug/singlestep)" : "#GP (for doreti_iret finder)";
+
+        send_response(sock, "  Vec %2d %-26s handler=", v, label);
+        if (h >= text_start && h < text_end)
+            send_response(sock, "ktext+0x%lx", h - text_start);
+        else
+            send_response(sock, "0x%lx", h);
+        send_response(sock, "  IST=%d\n", ist);
+    }
+
+    send_response(sock, "\nNotes:\n");
+    send_response(sock, "  IST=0 means handler uses current kernel stack (need TSS mod for controlled stack)\n");
+    send_response(sock, "  IST>0 means handler uses dedicated IST stack from TSS (can read/overwrite via kR/W)\n");
+    send_response(sock, "  IDT base address is needed for Phase 7c (redirect #DB handler)\n");
+    send_response(sock, "OK\n");
+}
+
 /* Display kernel information */
 static void
 cmd_kinfo(int sock) {
@@ -2414,6 +2657,8 @@ handle_command(int sock, char *cmd) {
         cmd_analyze_apic_ops(sock, cmd + 17);
     } else if (strcmp(cmd, "find_cfi_targets") == 0) {
         cmd_find_cfi_targets(sock);
+    } else if (strcmp(cmd, "dump_idt") == 0) {
+        cmd_dump_idt(sock);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -2445,6 +2690,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "identify_table <off> [ctx] - Identify func ptr table (kdata offset)\n");
         send_response(sock, "analyze_apic_ops <off>   - Full apic_ops analysis (36 entries)\n");
         send_response(sock, "find_cfi_targets         - Find CFI-valid function targets\n");
+        send_response(sock, "dump_idt                 - Dump IDT (handlers, IST, types)\n");
         send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
