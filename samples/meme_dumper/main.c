@@ -2893,165 +2893,162 @@ cmd_find_doreti_iret(int sock)
     if (find_idt_base(sock, &idt_base) == 0) {
         found_idt = 1;
         send_response(sock, "IDT base: 0x%lx\n", idt_base);
+    } else {
+        send_response(sock, "IDT not found (HV-managed?) - skipping to broad scan\n");
     }
 
-    if (!found_idt) {
-        send_response(sock, "ERROR: Could not locate IDT\n");
-        send_response(sock, "OK\n");
-        return;
-    }
-
-    /* Read full IDT */
+    /* Read full IDT (if found) */
     uint8_t idt[4096];
-    if (kernel_copyout(idt_base, idt, sizeof(idt)) != 0) {
-        send_response(sock, "ERROR: Failed to read IDT at 0x%lx\n", idt_base);
-        send_response(sock, "OK\n");
-        return;
-    }
-
-    /* ---- Step 2: Extract Key Handler Addresses ---- */
-    send_response(sock, "\n--- Step 2: Key Handler Addresses ---\n");
-    send_response(sock, "%-4s %-16s %-22s %s\n", "Vec", "Name", "Handler", "IST");
-    send_response(sock, "---- ---------------- ---------------------- ---\n");
-
-    for (int h = 0; h < 3; h++) {
-        int v = key_handlers[h].vec;
-        uint8_t *e = idt + v * 16;
-
-        uint16_t off_low, off_mid;
-        uint32_t off_high;
-        memcpy(&off_low, e + 0, 2);
-        memcpy(&off_mid, e + 6, 2);
-        memcpy(&off_high, e + 8, 4);
-
-        uint64_t handler = (uint64_t)off_low |
-                           ((uint64_t)off_mid << 16) |
-                           ((uint64_t)off_high << 32);
-        uint8_t ist = e[4] & 0x07;
-        uint8_t p = (e[5] >> 7) & 0x01;
-
-        key_handlers[h].handler_va = handler;
-        key_handlers[h].ist = ist;
-
-        if (!p) {
-            send_response(sock, "%3d  %-16s (not present)\n", v, key_handlers[h].name);
-            continue;
-        }
-
-        if (handler >= (uint64_t)ktext_base &&
-            handler < (uint64_t)ktext_base + 0x1000000) {
-            send_response(sock, "%3d  %-16s ktext+0x%-14lx %d\n",
-                          v, key_handlers[h].name,
-                          handler - (uint64_t)ktext_base, ist);
-        } else {
-            send_response(sock, "%3d  %-16s 0x%-20lx %d\n",
-                          v, key_handlers[h].name, handler, ist);
+    if (found_idt) {
+        if (kernel_copyout(idt_base, idt, sizeof(idt)) != 0) {
+            send_response(sock, "WARNING: Failed to read IDT at 0x%lx\n", idt_base);
+            found_idt = 0;
         }
     }
-
-    /* ---- Step 3: Get Physical Addresses ---- */
-    send_response(sock, "\n--- Step 3: Handler Physical Addresses ---\n");
-    send_response(sock, "%-4s %-20s %-18s %s\n",
-                  "Vec", "Handler VA", "Physical Addr", "DMAP");
-    send_response(sock, "---- -------------------- ------------------ --------\n");
-
-    for (int h = 0; h < 3; h++) {
-        if (key_handlers[h].handler_va == 0)
-            continue;
-
-        uint64_t paddr, flags;
-        if (vaddr_to_paddr_quiet(dmap_base, pm_cr3,
-                                 key_handlers[h].handler_va,
-                                 &paddr, &flags) == 0) {
-            key_handlers[h].handler_pa = paddr;
-            key_handlers[h].pa_valid = 1;
-
-            /* Test DMAP readability */
-            uint8_t test[8];
-            if (kernel_copyout(dmap_base + paddr, test, sizeof(test)) == 0) {
-                key_handlers[h].dmap_readable = 1;
-                send_response(sock, "%3d  0x%016lx   0x%014lx   READABLE\n",
-                              key_handlers[h].vec,
-                              key_handlers[h].handler_va, paddr);
-            } else {
-                send_response(sock, "%3d  0x%016lx   0x%014lx   BLOCKED\n",
-                              key_handlers[h].vec,
-                              key_handlers[h].handler_va, paddr);
-            }
-        } else {
-            send_response(sock, "%3d  0x%016lx   TRANSLATION FAILED\n",
-                          key_handlers[h].vec,
-                          key_handlers[h].handler_va);
-        }
-    }
-
-    /* ---- Step 4: Scan Handler Vicinity ---- */
-    send_response(sock, "\n--- Step 4: Scanning Handler Vicinity (+-32KB) ---\n");
 
     int vicinity_pages_readable = 0, vicinity_pages_blocked = 0;
     uint8_t page_buf[4096];
 
-    for (int h = 0; h < 3; h++) {
-        if (!key_handlers[h].pa_valid || !key_handlers[h].dmap_readable)
-            continue;
+    if (found_idt) {
+        /* ---- Step 2: Extract Key Handler Addresses ---- */
+        send_response(sock, "\n--- Step 2: Key Handler Addresses ---\n");
+        send_response(sock, "%-4s %-16s %-22s %s\n", "Vec", "Name", "Handler", "IST");
+        send_response(sock, "---- ---------------- ---------------------- ---\n");
 
-        uint64_t base_pa = key_handlers[h].handler_pa & ~0xFFFUL;
-        /* Scan 8 pages before and 8 pages after (64KB window) */
-        uint64_t scan_start = (base_pa > 8 * 0x1000) ? base_pa - 8 * 0x1000 : 0;
-        uint64_t scan_end = base_pa + 8 * 0x1000;
+        for (int h = 0; h < 3; h++) {
+            int v = key_handlers[h].vec;
+            uint8_t *e = idt + v * 16;
 
-        send_response(sock, "Scanning around vec %d %s (PA 0x%lx)...\n",
-                      key_handlers[h].vec, key_handlers[h].name, base_pa);
+            uint16_t off_low, off_mid;
+            uint32_t off_high;
+            memcpy(&off_low, e + 0, 2);
+            memcpy(&off_mid, e + 6, 2);
+            memcpy(&off_high, e + 8, 4);
 
-        for (uint64_t pa = scan_start; pa < scan_end; pa += 0x1000) {
-            if (kernel_copyout(dmap_base + pa, page_buf, sizeof(page_buf)) != 0) {
-                vicinity_pages_blocked++;
+            uint64_t handler = (uint64_t)off_low |
+                               ((uint64_t)off_mid << 16) |
+                               ((uint64_t)off_high << 32);
+            uint8_t ist = e[4] & 0x07;
+            uint8_t p = (e[5] >> 7) & 0x01;
+
+            key_handlers[h].handler_va = handler;
+            key_handlers[h].ist = ist;
+
+            if (!p) {
+                send_response(sock, "%3d  %-16s (not present)\n", v, key_handlers[h].name);
                 continue;
             }
-            vicinity_pages_readable++;
 
-            /* Search for iretq in this page */
-            for (size_t i = 0; i < sizeof(page_buf) - 1; i++) {
-                if (memcmp(&page_buf[i], sig_iretq, sizeof(sig_iretq)) != 0)
-                    continue;
-
-                if (num_candidates >= MAX_DORETI_CANDIDATES)
-                    goto vicinity_done;
-
-                /* Check for swapgs within 32 bytes before iretq */
-                int has_swapgs = 0;
-                size_t check_start = (i >= 32) ? i - 32 : 0;
-                for (size_t j = check_start; j + 2 < i; j++) {
-                    if (memcmp(&page_buf[j], sig_swapgs, sizeof(sig_swapgs)) == 0) {
-                        has_swapgs = 1;
-                        break;
-                    }
-                }
-
-                uint64_t cand_pa = pa + i;
-                /* Estimate ktext offset: handler_va + (cand_pa - handler_pa) */
-                uint64_t est_ktext_off = (key_handlers[h].handler_va -
-                                          (uint64_t)ktext_base) +
-                                         (int64_t)(cand_pa - key_handlers[h].handler_pa);
-                int page_dist = (int)((int64_t)(pa - base_pa) / 0x1000);
-
-                candidates[num_candidates].paddr = cand_pa;
-                candidates[num_candidates].ktext_offset = est_ktext_off;
-                candidates[num_candidates].has_swapgs_before = has_swapgs;
-                candidates[num_candidates].near_handler = key_handlers[h].vec;
-                candidates[num_candidates].page_dist = page_dist;
-                num_candidates++;
-
-                send_response(sock, "  iretq @ PA 0x%lx (est ktext+0x%lx) swapgs=%s\n",
-                              cand_pa, est_ktext_off,
-                              has_swapgs ? "YES" : "NO");
+            if (handler >= (uint64_t)ktext_base &&
+                handler < (uint64_t)ktext_base + 0x1000000) {
+                send_response(sock, "%3d  %-16s ktext+0x%-14lx %d\n",
+                              v, key_handlers[h].name,
+                              handler - (uint64_t)ktext_base, ist);
+            } else {
+                send_response(sock, "%3d  %-16s 0x%-20lx %d\n",
+                              v, key_handlers[h].name, handler, ist);
             }
         }
-    }
-vicinity_done:
 
-    send_response(sock, "Handler vicinity: %d candidates, %d pages readable, %d blocked\n",
-                  num_candidates, vicinity_pages_readable, vicinity_pages_blocked);
+        /* ---- Step 3: Get Physical Addresses ---- */
+        send_response(sock, "\n--- Step 3: Handler Physical Addresses ---\n");
+        send_response(sock, "%-4s %-20s %-18s %s\n",
+                      "Vec", "Handler VA", "Physical Addr", "DMAP");
+        send_response(sock, "---- -------------------- ------------------ --------\n");
+
+        for (int h = 0; h < 3; h++) {
+            if (key_handlers[h].handler_va == 0)
+                continue;
+
+            uint64_t paddr, flags;
+            if (vaddr_to_paddr_quiet(dmap_base, pm_cr3,
+                                     key_handlers[h].handler_va,
+                                     &paddr, &flags) == 0) {
+                key_handlers[h].handler_pa = paddr;
+                key_handlers[h].pa_valid = 1;
+
+                /* Test DMAP readability */
+                uint8_t test[8];
+                if (kernel_copyout(dmap_base + paddr, test, sizeof(test)) == 0) {
+                    key_handlers[h].dmap_readable = 1;
+                    send_response(sock, "%3d  0x%016lx   0x%014lx   READABLE\n",
+                                  key_handlers[h].vec,
+                                  key_handlers[h].handler_va, paddr);
+                } else {
+                    send_response(sock, "%3d  0x%016lx   0x%014lx   BLOCKED\n",
+                                  key_handlers[h].vec,
+                                  key_handlers[h].handler_va, paddr);
+                }
+            } else {
+                send_response(sock, "%3d  0x%016lx   TRANSLATION FAILED\n",
+                              key_handlers[h].vec,
+                              key_handlers[h].handler_va);
+            }
+        }
+
+        /* ---- Step 4: Scan Handler Vicinity ---- */
+        send_response(sock, "\n--- Step 4: Scanning Handler Vicinity (+-32KB) ---\n");
+
+        for (int h = 0; h < 3; h++) {
+            if (!key_handlers[h].pa_valid || !key_handlers[h].dmap_readable)
+                continue;
+
+            uint64_t base_pa = key_handlers[h].handler_pa & ~0xFFFUL;
+            uint64_t scan_start = (base_pa > 8 * 0x1000) ? base_pa - 8 * 0x1000 : 0;
+            uint64_t scan_end = base_pa + 8 * 0x1000;
+
+            send_response(sock, "Scanning around vec %d %s (PA 0x%lx)...\n",
+                          key_handlers[h].vec, key_handlers[h].name, base_pa);
+
+            for (uint64_t pa = scan_start; pa < scan_end; pa += 0x1000) {
+                if (kernel_copyout(dmap_base + pa, page_buf, sizeof(page_buf)) != 0) {
+                    vicinity_pages_blocked++;
+                    continue;
+                }
+                vicinity_pages_readable++;
+
+                for (size_t i = 0; i < sizeof(page_buf) - 1; i++) {
+                    if (memcmp(&page_buf[i], sig_iretq, sizeof(sig_iretq)) != 0)
+                        continue;
+
+                    if (num_candidates >= MAX_DORETI_CANDIDATES)
+                        goto vicinity_done;
+
+                    int has_swapgs = 0;
+                    size_t check_start = (i >= 32) ? i - 32 : 0;
+                    for (size_t j = check_start; j + 2 < i; j++) {
+                        if (memcmp(&page_buf[j], sig_swapgs, sizeof(sig_swapgs)) == 0) {
+                            has_swapgs = 1;
+                            break;
+                        }
+                    }
+
+                    uint64_t cand_pa = pa + i;
+                    uint64_t est_ktext_off = (key_handlers[h].handler_va -
+                                              (uint64_t)ktext_base) +
+                                             (int64_t)(cand_pa - key_handlers[h].handler_pa);
+                    int page_dist = (int)((int64_t)(pa - base_pa) / 0x1000);
+
+                    candidates[num_candidates].paddr = cand_pa;
+                    candidates[num_candidates].ktext_offset = est_ktext_off;
+                    candidates[num_candidates].has_swapgs_before = has_swapgs;
+                    candidates[num_candidates].near_handler = key_handlers[h].vec;
+                    candidates[num_candidates].page_dist = page_dist;
+                    num_candidates++;
+
+                    send_response(sock, "  iretq @ PA 0x%lx (est ktext+0x%lx) swapgs=%s\n",
+                                  cand_pa, est_ktext_off,
+                                  has_swapgs ? "YES" : "NO");
+                }
+            }
+        }
+    vicinity_done:
+
+        send_response(sock, "Handler vicinity: %d candidates, %d pages readable, %d blocked\n",
+                      num_candidates, vicinity_pages_readable, vicinity_pages_blocked);
+    } else {
+        send_response(sock, "\n--- Steps 2-4: Skipped (no IDT) ---\n");
+    }
 
     /* ---- Step 5: Broad Kernel .text Physical Scan ---- */
     send_response(sock, "\n--- Step 5: Broad Kernel .text Physical Scan ---\n");
@@ -3070,7 +3067,11 @@ vicinity_done:
     if (have_text_pa) {
         send_response(sock, "ktext PA: 0x%lx (from page table walk)\n", text_pa);
         broad_start = (text_pa & ~0xFFFUL);
-        broad_end = broad_start + 0x400000; /* 4MB */
+        /* Without IDT we have no handler seeds, scan the full .text (16MB) */
+        if (found_idt)
+            broad_end = broad_start + 0x400000; /* 4MB */
+        else
+            broad_end = broad_start + 0x1000000; /* 16MB */
     } else {
         /* Use handler PA as anchor, scan wider range */
         send_response(sock, "ktext PA translation failed, using handler PA as anchor\n");
@@ -3089,9 +3090,10 @@ vicinity_done:
         broad_end = (anchor & ~0xFFFUL) + 0x400000;
     }
 
-    /* Cap at 2048 pages (8MB) */
-    if ((broad_end - broad_start) / 0x1000 > 2048)
-        broad_end = broad_start + 2048 * 0x1000;
+    /* Cap: 4096 pages (16MB) without IDT, 2048 (8MB) with */
+    uint64_t max_pages = found_idt ? 2048 : 4096;
+    if ((broad_end - broad_start) / 0x1000 > max_pages)
+        broad_end = broad_start + max_pages * 0x1000;
 
     send_response(sock, "Scan range: PA 0x%lx - 0x%lx (%lu pages)\n",
                   broad_start, broad_end,
@@ -3100,6 +3102,12 @@ vicinity_done:
     for (uint64_t pa = broad_start;
          pa < broad_end && num_candidates < MAX_DORETI_CANDIDATES;
          pa += 0x1000) {
+
+        int page_num = (int)((pa - broad_start) / 0x1000);
+        if (page_num % 1024 == 0)
+            send_response(sock, "  ...%d pages (%luMB)\n",
+                          page_num,
+                          (unsigned long)(page_num * 4096 / (1024 * 1024)));
 
         if (kernel_copyout(dmap_base + pa, page_buf, sizeof(page_buf)) != 0) {
             broad_blocked++;
