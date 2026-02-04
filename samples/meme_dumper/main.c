@@ -579,6 +579,101 @@ cmd_probe_xom(int sock)
 }
 
 /*
+ * find_kcr3 - Search for the kernel's actual CR3/PML4
+ * The pm_cr3 in pmap_store appears to be user-space CR3.
+ * We search for a PML4 that has entry 511 present (kernel space mapping).
+ */
+static void
+cmd_find_kcr3(int sock)
+{
+    uint64_t dmap_base = get_dmap_base();
+
+    send_response(sock, "=== Searching for Kernel CR3 ===\n");
+    send_response(sock, "DMAP base: 0x%lx\n\n", dmap_base);
+
+    /* Strategy 1: Check some known physical addresses where kernel PML4 might be */
+    uint64_t candidates[] = {
+        0x1000000,   /* 16MB - common location */
+        0x1001000,
+        0x1002000,
+        0x1010000,
+        0x1020000,
+        0x1030000,
+        0x1040000,
+        0x1100000,
+        0x1200000,
+        0x1400000,
+        0x1430000,   /* Current pm_cr3 value */
+        0x1500000,
+        0x2000000,
+        0x3000000,
+        0x4000000,
+    };
+
+    send_response(sock, "Checking known physical addresses for valid kernel PML4...\n\n");
+
+    for (int i = 0; i < (int)(sizeof(candidates) / sizeof(candidates[0])); i++) {
+        uint64_t cr3_candidate = candidates[i];
+        uint64_t pml4e_paddr = cr3_candidate + (511 * 8);  /* PML4E[511] */
+        uint64_t pml4e = kernel_getlong(dmap_base + pml4e_paddr);
+
+        /* Check if PML4E[511] is present and looks valid */
+        int present = !!(pml4e & PTE_P);
+        int rw = !!(pml4e & PTE_RW);
+        uint64_t next_paddr = pml4e & PTE_FRAME;
+
+        if (present && next_paddr != 0 && next_paddr < 0x800000000UL) {
+            send_response(sock, "CANDIDATE CR3=0x%lx: PML4E[511]=0x%lx (P=%d RW=%d next=0x%lx)\n",
+                          cr3_candidate, pml4e, present, rw, next_paddr);
+
+            /* Verify by checking if PDP[511] is also present */
+            uint64_t pdpe_paddr = next_paddr + (511 * 8);
+            uint64_t pdpe = kernel_getlong(dmap_base + pdpe_paddr);
+            int pdp_present = !!(pdpe & PTE_P);
+
+            if (pdp_present) {
+                send_response(sock, "  -> PDPE[511]=0x%lx (P=%d) - LIKELY VALID!\n",
+                              pdpe, pdp_present);
+            }
+        }
+    }
+
+    /* Strategy 2: Try to find kernel CR3 from a global variable */
+    send_response(sock, "\n=== Searching kernel globals for CR3 ===\n");
+
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+
+    /* Common offsets where KPML4phys might be stored */
+    uint64_t global_offsets[] = {
+        0x31dc4c8,  /* Possible KPML4phys offset */
+        0x31dc4d0,
+        0x31dc4d8,
+        0x31dc500,
+        0x31dc508,
+        0x3257a70,
+        0x3257a80,
+    };
+
+    for (int i = 0; i < (int)(sizeof(global_offsets) / sizeof(global_offsets[0])); i++) {
+        uint64_t val = kernel_getlong(kdata_base + global_offsets[i]);
+
+        /* Check if this looks like a valid CR3 (physical address, page-aligned) */
+        if ((val & 0xFFF) == 0 && val > 0 && val < 0x800000000UL) {
+            /* Try it as CR3 */
+            uint64_t pml4e_paddr = val + (511 * 8);
+            uint64_t pml4e = kernel_getlong(dmap_base + pml4e_paddr);
+
+            if (pml4e & PTE_P) {
+                send_response(sock, "FOUND at kdata+0x%lx: val=0x%lx -> PML4E[511]=0x%lx (PRESENT!)\n",
+                              global_offsets[i], val, pml4e);
+            }
+        }
+    }
+
+    send_response(sock, "OK\n");
+}
+
+/*
  * dump_pmap - Dump raw pmap_store structure to find correct offsets
  */
 static void
@@ -750,6 +845,8 @@ handle_command(int sock, char *cmd) {
         cmd_probe_xom(sock);
     } else if (strcmp(cmd, "dump_pmap") == 0) {
         cmd_dump_pmap(sock);
+    } else if (strcmp(cmd, "find_kcr3") == 0) {
+        cmd_find_kcr3(sock);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -762,6 +859,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "dump_pte <vaddr>         - Walk page tables for address\n");
         send_response(sock, "scan_pte <va> <n> [s]    - Scan PTEs for address range\n");
         send_response(sock, "cmp_sections             - Compare .text vs .data mappings\n");
+        send_response(sock, "find_kcr3                - Search for kernel CR3/PML4\n");
         send_response(sock, "probe_xom                - Analyze XOM protection mechanism\n");
         send_response(sock, "dump_pmap                - Debug: dump raw pmap_store structure\n");
         send_response(sock, "exit                     - Close connection\n");
