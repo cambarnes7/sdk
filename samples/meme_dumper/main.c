@@ -4083,8 +4083,11 @@ broad_done:
             uint64_t kdata = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
             uint64_t ktext = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
             uint64_t scan_size = 0x4000000; /* 64MB: matches TSS scan range */
+            uint64_t dmap_base = get_dmap_base();
             uint8_t page[4096];
             int idt_found = 0;
+            int ridt_candidates_total = 0;
+            int ridt_candidates_rejected = 0;
 
             for (uint64_t addr = kdata;
                  addr < kdata + scan_size && !idt_found;
@@ -4106,14 +4109,21 @@ broad_done:
                     if (base < 0xFFFF800000000000ULL)
                         continue;
 
-                    /* Safety: only probe base addresses within the
-                     * .data scan range we know is readable. Reading
-                     * from arbitrary kernel addresses can panic. */
-                    if (base < kdata || base + 4096 > kdata + scan_size)
+                    ridt_candidates_total++;
+                    /* Safety: only probe addresses we know are readable.
+                     * .data range is safe; DMAP (direct map of physical
+                     * memory) is also safe. Reading from .text (XOM) or
+                     * unmapped addresses can panic. */
+                    int base_safe = 0;
+                    if (base >= kdata && base + 4096 <= kdata + scan_size)
+                        base_safe = 1; /* in .data range */
+                    else if (base >= dmap_base &&
+                             base < dmap_base + 0x100000000ULL)
+                        base_safe = 1; /* in DMAP (first 4GB) */
+                    if (!base_safe) {
+                        ridt_candidates_rejected++;
                         continue;
-                    /* IDT is page-aligned */
-                    if (base & 0xFFF)
-                        continue;
+                    }
 
                     /* Candidate r_idt: validate by reading IDT gates */
                     uint8_t gates[64]; /* first 4 entries */
@@ -4143,21 +4153,20 @@ broad_done:
                                      ((uint64_t)g[9] << 40) |
                                      ((uint64_t)g[10] << 48) |
                                      ((uint64_t)g[11] << 56);
-                        if (h >= ktext && h < ktext + 0x2000000)
+                        if (h >= 0xFFFF800000000000ULL)
                             valid++;
                     }
 
                     if (valid >= 3) {
                         idt_base = base;
                         idt_found = 1;
-                        /* Log the CS selector from gate 0 */
                         uint16_t sel;
                         memcpy(&sel, gates + 2, 2);
                         send_response(sock,
                             "  r_idt at kdata+0x%lx: limit=0x%x "
                             "base=0x%lx (CS=0x%04x)\n",
-                            addr + off - kdata, limit,
-                            base, sel);
+                            (unsigned long)(addr + off - kdata),
+                            limit, base, sel);
                     }
                 }
             }
@@ -4199,7 +4208,7 @@ broad_done:
                                      ((uint64_t)g[9] << 40) |
                                      ((uint64_t)g[10] << 48) |
                                      ((uint64_t)g[11] << 56);
-                        if (h >= ktext && h < ktext + 0x2000000)
+                        if (h >= 0xFFFF800000000000ULL)
                             valid++;
                     }
                     if (valid >= 3) {
@@ -4210,13 +4219,19 @@ broad_done:
                         send_response(sock,
                             "  IDT gates at kdata+0x%lx (%d/4 valid, "
                             "CS=0x%04x)\n",
-                            addr - kdata, valid, sel);
+                            (unsigned long)(addr - kdata), valid, sel);
                     }
                 }
             }
 
             if (!idt_found) {
                 send_response(sock, "  IDT not found in kernel .data\n");
+                send_response(sock, "  Diag: kdata=0x%lx ktext=0x%lx "
+                              "dmap=0x%lx\n", kdata, ktext, dmap_base);
+                send_response(sock, "  Diag: r_idt candidates=%d "
+                              "rejected=%d\n",
+                              ridt_candidates_total,
+                              ridt_candidates_rejected);
                 goto step7_cleanup;
             }
         }
