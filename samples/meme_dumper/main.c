@@ -4066,54 +4066,114 @@ broad_done:
             send_response(sock, "  TSS IST%d: 0x%lx\n", i + 1, ist_entries[i]);
         }
 
-        /* 7b. Get IDT base via SIDT and read #GP gate */
-        send_response(sock, "\n7b. Reading IDT via SIDT...\n");
+        /* 7b. Find IDT by scanning kernel .data for the r_idt descriptor.
+         *
+         * FreeBSD stores the IDTR in a global `struct region_descriptor r_idt`
+         * (10 bytes packed: uint16_t limit + uint64_t base). For a standard
+         * 256-entry IDT: limit = 0x0FFF, base = kernel VA of the IDT table.
+         * We scan .data for this pattern, then validate by reading a few
+         * gate entries from the candidate base.
+         *
+         * Note: SIDT is trapped by the PS5 hypervisor, so we cannot use it.
+         */
+        send_response(sock, "\n7b. Finding IDT (r_idt scan)...\n");
         {
-            struct {
-                uint16_t limit;
-                uint64_t base;
-            } __attribute__((packed)) idtr;
-            __asm__ volatile("sidt %0" : "=m"(idtr));
+            uint64_t kdata = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+            uint64_t ktext = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
+            uint64_t scan_size = 0x2000000; /* 32MB */
+            uint8_t page[4096];
+            int idt_found = 0;
 
-            send_response(sock, "  SIDT: base=0x%lx limit=%u\n",
-                          (unsigned long)idtr.base, idtr.limit);
+            for (uint64_t addr = kdata;
+                 addr < kdata + scan_size && !idt_found;
+                 addr += 4096) {
+                if (kernel_copyout(addr, page, 4096) != 0)
+                    continue;
 
-            /* Validate: kernel address, room for 256 vectors (4096 bytes) */
-            if (idtr.base >= 0xFFFF800000000000ULL && idtr.limit >= 0xFFF) {
-                idt_base = idtr.base;
+                /* Scan for limit=0x0FFF followed by kernel address */
+                for (int off = 0; off + 10 <= 4096 && !idt_found; off += 2) {
+                    uint16_t limit;
+                    uint64_t base;
+                    memcpy(&limit, page + off, 2);
+                    if (limit != 0x0FFF)
+                        continue;
+                    memcpy(&base, page + off + 2, 8);
+                    if (base < 0xFFFF800000000000ULL)
+                        continue;
 
-                uint8_t gp_gate[16];
-                if (kernel_copyout(idt_base + 13 * 16, gp_gate, 16) == 0) {
-                    gp_ist_index = gp_gate[4] & 0x07;
+                    /* Candidate r_idt: validate by reading IDT gates */
+                    uint8_t gates[64]; /* first 4 entries */
+                    if (kernel_copyout(base, gates, 64) != 0)
+                        continue;
 
-                    uint64_t gp_handler =
-                        (uint64_t)gp_gate[0] |
-                        ((uint64_t)gp_gate[1] << 8) |
-                        ((uint64_t)gp_gate[6] << 16) |
-                        ((uint64_t)gp_gate[7] << 24) |
-                        ((uint64_t)gp_gate[8] << 32) |
-                        ((uint64_t)gp_gate[9] << 40) |
-                        ((uint64_t)gp_gate[10] << 48) |
-                        ((uint64_t)gp_gate[11] << 56);
-                    uint8_t type_attr = gp_gate[5];
-
-                    send_response(sock, "  #GP gate: handler=0x%lx IST=%d "
-                                  "type=0x%02x\n",
-                                  gp_handler, gp_ist_index, type_attr);
-
-                    if (!((type_attr & 0x8E) == 0x8E &&
-                          gp_handler >= 0xFFFF800000000000ULL)) {
-                        send_response(sock, "  WARNING: #GP gate looks invalid, "
-                                      "proceeding anyway\n");
+                    int valid = 0;
+                    for (int v = 0; v < 4; v++) {
+                        uint8_t *g = gates + v * 16;
+                        /* Check present bit + gate type */
+                        if (!(g[5] & 0x80))
+                            continue;
+                        uint8_t type = g[5] & 0x0F;
+                        if (type != 14 && type != 15)
+                            continue;
+                        /* Check reserved bytes 12-15 are zero */
+                        uint32_t rsvd;
+                        memcpy(&rsvd, g + 12, 4);
+                        if (rsvd != 0)
+                            continue;
+                        /* Check handler is kernel address */
+                        uint64_t h = (uint64_t)g[0] |
+                                     ((uint64_t)g[1] << 8) |
+                                     ((uint64_t)g[6] << 16) |
+                                     ((uint64_t)g[7] << 24) |
+                                     ((uint64_t)g[8] << 32) |
+                                     ((uint64_t)g[9] << 40) |
+                                     ((uint64_t)g[10] << 48) |
+                                     ((uint64_t)g[11] << 56);
+                        if (h >= ktext && h < ktext + 0x2000000)
+                            valid++;
                     }
-                } else {
-                    send_response(sock, "  Cannot read #GP gate\n");
-                    goto step7_cleanup;
+
+                    if (valid >= 3) {
+                        idt_base = base;
+                        idt_found = 1;
+                        /* Log the CS selector from gate 0 */
+                        uint16_t sel;
+                        memcpy(&sel, gates + 2, 2);
+                        send_response(sock,
+                            "  r_idt at kdata+0x%lx: limit=0x%x "
+                            "base=0x%lx (CS=0x%04x)\n",
+                            addr + off - kdata, limit,
+                            base, sel);
+                    }
                 }
-            } else {
-                send_response(sock, "  SIDT returned unexpected value\n");
+            }
+
+            if (!idt_found) {
+                send_response(sock, "  IDT not found in kernel .data\n");
                 goto step7_cleanup;
             }
+
+            /* Read #GP gate (vector 13) */
+            uint8_t gp_gate[16];
+            if (kernel_copyout(idt_base + 13 * 16, gp_gate, 16) != 0) {
+                send_response(sock, "  Cannot read #GP gate\n");
+                goto step7_cleanup;
+            }
+
+            gp_ist_index = gp_gate[4] & 0x07;
+            uint64_t gp_handler =
+                (uint64_t)gp_gate[0] |
+                ((uint64_t)gp_gate[1] << 8) |
+                ((uint64_t)gp_gate[6] << 16) |
+                ((uint64_t)gp_gate[7] << 24) |
+                ((uint64_t)gp_gate[8] << 32) |
+                ((uint64_t)gp_gate[9] << 40) |
+                ((uint64_t)gp_gate[10] << 48) |
+                ((uint64_t)gp_gate[11] << 56);
+
+            send_response(sock, "  #GP gate: handler=0x%lx IST=%d "
+                          "type=0x%02x\n",
+                          gp_handler, gp_ist_index, gp_gate[5]);
         }
 
         /* 7c. Allocate IST page */
