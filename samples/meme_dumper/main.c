@@ -882,12 +882,6 @@ cmd_scan_code_sig(int sock, const char *args)
     /* Known kernel code signatures */
     /* swapgs; mov %rsp, %gs:xxx - syscall entry */
     static const uint8_t sig_swapgs[] = {0x0f, 0x01, 0xf8};
-    /* push %rbp; mov %rsp, %rbp - common function prologue */
-    static const uint8_t sig_prologue[] = {0x55, 0x48, 0x89, 0xe5};
-    /* cli - disable interrupts (kernel code) */
-    static const uint8_t sig_cli[] = {0xfa};
-    /* sti - enable interrupts */
-    static const uint8_t sig_sti[] = {0xfb};
     /* iretq - interrupt return */
     static const uint8_t sig_iretq[] = {0x48, 0xcf};
 
