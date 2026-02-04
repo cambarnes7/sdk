@@ -2960,8 +2960,12 @@ find_tss_in_kdata(int sock, int *stride_out)
     uint8_t buf[4096];
 
     send_response(sock, "Scanning 64MB from kdata for TSS...\n");
+    int tss_candidates_rejected = 0;
 
     for (uint64_t off = 0; off < scan_size; off += sizeof(buf)) {
+        if ((off & 0x7FFFFF) == 0 && off != 0)
+            send_response(sock, "  ...%luMB (rejected %d)\n",
+                          (unsigned long)(off >> 20), tss_candidates_rejected);
         if (kernel_copyout(kdata_base + off, buf, sizeof(buf)) != 0)
             continue;
 
@@ -2975,8 +2979,11 @@ find_tss_in_kdata(int sock, int *stride_out)
                 continue;
 
             memcpy(&rsp0, buf + i + 4, 8);
-            /* rsp0 must be a kernel address */
-            if (rsp0 < (uint64_t)ktext_base || rsp0 == 0)
+            /* rsp0 must be a valid kernel stack pointer.
+             * Reject 0, non-kernel, and sentinel values like -1.
+             * Also require 16-byte alignment (ABI stack alignment). */
+            if (rsp0 == 0 || rsp0 < (uint64_t)ktext_base ||
+                rsp0 == 0xFFFFFFFFFFFFFFFFULL || (rsp0 & 0xF) != 0)
                 continue;
 
             memcpy(&rsp1, buf + i + 12, 8);
@@ -2990,13 +2997,15 @@ find_tss_in_kdata(int sock, int *stride_out)
             if (rsvd64 != 0)
                 continue;
 
-            /* Validate IST1-7 (offsets 0x24..0x5b): each 0 or kernel addr */
+            /* Validate IST1-7 (offsets 0x24..0x5b): each 0 or valid kernel addr.
+             * Reject sentinel value -1 (seen in false positives on PS5). */
             int ist_ok = 1;
             for (int ist = 0; ist < 7; ist++) {
                 uint64_t ist_val;
                 memcpy(&ist_val, buf + i + 0x24 + ist * 8, 8);
                 if (ist_val != 0 &&
-                    ist_val < (uint64_t)ktext_base) {
+                    (ist_val < (uint64_t)ktext_base ||
+                     ist_val == 0xFFFFFFFFFFFFFFFFULL)) {
                     ist_ok = 0;
                     break;
                 }
@@ -3020,7 +3029,9 @@ find_tss_in_kdata(int sock, int *stride_out)
                     continue;
                 if (kernel_copyout(next_addr + 4, &next_rsp0, 8) != 0)
                     continue;
-                if (next_rsp0 >= (uint64_t)ktext_base && next_rsp0 != 0) {
+                if (next_rsp0 >= (uint64_t)ktext_base && next_rsp0 != 0 &&
+                    next_rsp0 != 0xFFFFFFFFFFFFFFFFULL &&
+                    (next_rsp0 & 0xF) == 0) {
                     found_second = 1;
                     if (stride_out)
                         *stride_out = stride;
@@ -3032,9 +3043,147 @@ find_tss_in_kdata(int sock, int *stride_out)
 
             if (found_second)
                 return tss_va;
+
+            /* Passed all single-TSS checks but no stride match */
+            tss_candidates_rejected++;
+            if (tss_candidates_rejected <= 5)
+                send_response(sock, "  rejected candidate at 0x%lx "
+                              "(rsp0=0x%lx, no stride match)\n",
+                              tss_va, rsp0);
         }
     }
 
+    send_response(sock, "  TSS scan complete: %d candidates rejected\n",
+                  tss_candidates_rejected);
+    return 0;
+}
+
+/*
+ * find_tss_via_gdt - Find TSS by scanning for GDT TSS descriptors.
+ *
+ * The GDT contains a 16-byte system segment descriptor for the TSS.
+ * On x86-64, the TSS descriptor has:
+ *   - access byte (byte 5) == 0x89 (available TSS) or 0x8B (busy TSS)
+ *   - bytes 12-15 reserved (must be 0)
+ *   - limit >= 0x67 (TSS is at least 104 bytes)
+ *   - base is a kernel address
+ *
+ * We scan kernel .data for this pattern.  When found, we validate the
+ * TSS structure at the decoded base address and confirm with stride.
+ *
+ * Returns the TSS base address from the descriptor, or 0 on failure.
+ */
+static uint64_t
+find_tss_via_gdt(int sock, int *stride_out)
+{
+    uint64_t kdata_base = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+    uint64_t ktext_base = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
+    uint64_t scan_size  = 0x4000000; /* 64MB */
+    uint8_t buf[4096];
+
+    send_response(sock, "GDT scan: looking for TSS descriptors...\n");
+    int descs_found = 0;
+
+    for (uint64_t off = 0; off < scan_size; off += sizeof(buf)) {
+        if ((off & 0x7FFFFF) == 0 && off != 0)
+            send_response(sock, "  ...%luMB\n",
+                          (unsigned long)(off >> 20));
+        if (kernel_copyout(kdata_base + off, buf, sizeof(buf)) != 0)
+            continue;
+
+        /* Scan for TSS descriptors at 8-byte alignment */
+        for (int i = 0; i <= (int)sizeof(buf) - 16; i += 8) {
+            uint8_t access = buf[i + 5];
+            /* Available 64-bit TSS = 0x89, Busy = 0x8B */
+            if (access != 0x89 && access != 0x8B)
+                continue;
+
+            /* byte 4 must be DPL=0 (bits 5-6), S=0 (bit 4),
+             * so upper nibble of access should be 0x8 */
+            if ((access & 0xF0) != 0x80)
+                continue;
+
+            /* Check reserved bytes 12-15 of descriptor */
+            uint32_t desc_rsvd;
+            memcpy(&desc_rsvd, buf + i + 12, 4);
+            if (desc_rsvd != 0)
+                continue;
+
+            /* Reconstruct limit (bits 0-15 + bits 16-19 from byte 6) */
+            uint32_t limit = (uint32_t)buf[i] |
+                            ((uint32_t)buf[i + 1] << 8) |
+                            (((uint32_t)buf[i + 6] & 0x0F) << 16);
+            if (limit < 0x67) /* TSS minimum = 104 bytes, limit = size-1 */
+                continue;
+
+            /* Reconstruct 64-bit base address */
+            uint64_t base = (uint64_t)buf[i + 2] |
+                           ((uint64_t)buf[i + 3] << 8) |
+                           ((uint64_t)buf[i + 4] << 16) |
+                           ((uint64_t)buf[i + 7] << 24);
+            uint32_t base_hi;
+            memcpy(&base_hi, buf + i + 8, 4);
+            base |= ((uint64_t)base_hi << 32);
+
+            if (base < ktext_base || base == 0 ||
+                base == 0xFFFFFFFFFFFFFFFFULL)
+                continue;
+
+            descs_found++;
+            send_response(sock, "  GDT TSS desc at kdata+0x%lx: "
+                         "base=0x%lx limit=0x%x access=0x%02x\n",
+                         (unsigned long)(off + i), base, limit, access);
+
+            /* Validate the TSS structure at the decoded base */
+            uint32_t tss_rsvd0;
+            uint64_t tss_rsp0;
+            if (kernel_copyout(base, &tss_rsvd0, 4) != 0)
+                continue;
+            if (tss_rsvd0 != 0) {
+                send_response(sock, "    rsvd0=%u (skip)\n", tss_rsvd0);
+                continue;
+            }
+            if (kernel_copyout(base + 4, &tss_rsp0, 8) != 0)
+                continue;
+            if (tss_rsp0 == 0 || tss_rsp0 < ktext_base ||
+                tss_rsp0 == 0xFFFFFFFFFFFFFFFFULL) {
+                send_response(sock, "    rsp0=0x%lx (invalid, skip)\n",
+                              tss_rsp0);
+                continue;
+            }
+
+            send_response(sock, "    rsp0=0x%lx (valid)\n", tss_rsp0);
+
+            /* Find stride to next CPU's TSS */
+            for (int stride = 104; stride <= 4096; stride += 8) {
+                uint32_t next_rsvd0;
+                uint64_t next_rsp0;
+                if (kernel_copyout(base + stride, &next_rsvd0, 4) != 0)
+                    continue;
+                if (next_rsvd0 != 0)
+                    continue;
+                if (kernel_copyout(base + stride + 4, &next_rsp0, 8) != 0)
+                    continue;
+                if (next_rsp0 >= ktext_base && next_rsp0 != 0 &&
+                    next_rsp0 != 0xFFFFFFFFFFFFFFFFULL &&
+                    (next_rsp0 & 0xF) == 0) {
+                    if (stride_out) *stride_out = stride;
+                    send_response(sock, "  TSS confirmed via GDT at "
+                                 "0x%lx (stride=%d)\n", base, stride);
+                    return base;
+                }
+            }
+
+            /* Accept even without stride — GDT descriptor is strong evidence */
+            send_response(sock, "  TSS at 0x%lx (no stride, single-CPU?)\n",
+                         base);
+            if (stride_out) *stride_out = 104;
+            return base;
+        }
+    }
+
+    send_response(sock, "  GDT scan: %d descriptors found, none valid\n",
+                  descs_found);
     return 0;
 }
 
@@ -4102,6 +4251,11 @@ broad_done:
         send_response(sock, "7a. Finding TSS in kernel .data...\n");
         tss_va = find_tss_in_kdata(sock, &tss_stride);
         if (tss_va == 0) {
+            send_response(sock, "  Direct TSS scan failed; "
+                          "trying GDT-based TSS discovery...\n");
+            tss_va = find_tss_via_gdt(sock, &tss_stride);
+        }
+        if (tss_va == 0) {
             send_response(sock, "TSS not found, cannot proceed with Step 7\n");
             goto step7_cleanup;
         }
@@ -4536,7 +4690,8 @@ broad_done:
                     break;
                 }
                 if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0 ||
-                    rsp0 == 0 || rsp0 < kaddr_min) {
+                    rsp0 == 0 || rsp0 < kaddr_min ||
+                    rsp0 == 0xFFFFFFFFFFFFFFFFULL) {
                     send_response(sock, "  CPU%d: rsp0=0x%lx (invalid), stopping\n",
                                   cpu, rsp0);
                     break;
