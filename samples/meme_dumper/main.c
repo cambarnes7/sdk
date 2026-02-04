@@ -1956,6 +1956,152 @@ cmd_identify_table(int sock, const char *args)
     send_response(sock, "OK\n");
 }
 
+/*
+ * FreeBSD apic_ops field names (31 known + potential PS5 extensions)
+ */
+static const char *apic_ops_fields[] = {
+    "create", "init", "xapic_mode ***", "is_x2apic",
+    "setup", "dump", "disable", "eoi",
+    "id", "intr_pending", "set_logical_id", "cpuid",
+    "alloc_vector", "alloc_vectors", "enable_vector", "disable_vector",
+    "free_vector", "enable_pmc", "disable_pmc", "reenable_pmc",
+    "enable_cmc", "enable_mca_elvt",
+    "ipi_raw", "ipi_vectored", "ipi_wait", "ipi_alloc", "ipi_free",
+    "set_lvt_mask", "set_lvt_mode", "set_lvt_polarity", "set_lvt_triggermode",
+    NULL
+};
+
+/*
+ * analyze_apic_ops - Full analysis of candidate apic_ops structure
+ * Usage: analyze_apic_ops <kdata_offset>
+ *
+ * Reads 36 qwords, classifies each entry, maps to FreeBSD field names,
+ * and searches for cross-references in .data.
+ */
+static void
+cmd_analyze_apic_ops(int sock, const char *args)
+{
+    unsigned long offset;
+    if (!args || sscanf(args, "%lx", &offset) != 1) {
+        send_response(sock, "Usage: analyze_apic_ops <kdata_offset>\n");
+        send_response(sock, "  e.g. analyze_apic_ops 179180\n");
+        return;
+    }
+
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+    uint64_t va = (uint64_t)kdata_base + offset;
+    uint64_t text_start = (uint64_t)ktext_base;
+    uint64_t text_end = text_start + 0x1000000;
+    uint64_t data_start = (uint64_t)kdata_base;
+    uint64_t data_end = data_start + 0x4000000;
+
+    int num_entries = 36;
+    uint64_t entries[36];
+
+    send_response(sock, "=== analyze_apic_ops at kdata+0x%lx (VA 0x%lx) ===\n\n",
+                  offset, va);
+
+    /* Read all 36 qwords */
+    if (kernel_copyout(va, entries, num_entries * 8) != 0) {
+        send_response(sock, "ERROR: failed to read %d bytes at 0x%lx\n",
+                      num_entries * 8, va);
+        return;
+    }
+
+    int text_count = 0, null_count = 0, data_count = 0, other_count = 0;
+
+    send_response(sock, "--- Entries (36 qwords) ---\n");
+    for (int i = 0; i < num_entries; i++) {
+        uint64_t val = entries[i];
+        const char *field;
+        const char *type;
+
+        /* Find field name - walk NULL-terminated array */
+        int fi = 0;
+        const char **fp = apic_ops_fields;
+        while (*fp && fi < i) { fp++; fi++; }
+        field = (fi == i && *fp) ? *fp : "(ps5 ext?)";
+
+        if (val == 0) {
+            type = "NULL";
+            null_count++;
+        } else if (val >= text_start && val < text_end) {
+            type = ".text";
+            text_count++;
+        } else if (val >= data_start && val < data_end) {
+            type = ".data";
+            data_count++;
+        } else {
+            type = "other";
+            other_count++;
+        }
+
+        if (val >= text_start && val < text_end) {
+            send_response(sock, "  [%2d] %-22s 0x%lx  (ktext+0x%lx)  %s\n",
+                          i, field, val, val - text_start, type);
+        } else {
+            send_response(sock, "  [%2d] %-22s 0x%016lx                %s\n",
+                          i, field, val, type);
+        }
+    }
+
+    /* Summary */
+    send_response(sock, "\n--- Summary ---\n");
+    send_response(sock, ".text ptrs: %d  NULL: %d  .data ptrs: %d  other: %d\n",
+                  text_count, null_count, data_count, other_count);
+
+    if (text_count >= 20) {
+        send_response(sock, "\n** STRONG apic_ops match (%d/36 .text ptrs) **\n",
+                      text_count);
+    } else if (text_count >= 10) {
+        send_response(sock, "\n* Possible apic_ops (%d/36 .text ptrs) *\n",
+                      text_count);
+    }
+
+    /* Cross-reference scan: search for pointers TO this table in .data */
+    send_response(sock, "\n--- Cross-references (ptrs to 0x%lx in .data) ---\n", va);
+    int xrefs = 0;
+    uint64_t scan_addr = data_start;
+    uint64_t scan_end = data_start + 0x1000000;  /* scan 16MB */
+    uint8_t scan_buf[4096];
+
+    while (scan_addr < scan_end) {
+        if (kernel_copyout(scan_addr, scan_buf, sizeof(scan_buf)) != 0) {
+            scan_addr += sizeof(scan_buf);
+            continue;
+        }
+        for (int i = 0; i <= (int)sizeof(scan_buf) - 8; i += 8) {
+            uint64_t val;
+            memcpy(&val, scan_buf + i, 8);
+            if (val == va) {
+                uint64_t ref_off = (scan_addr + i) - data_start;
+                send_response(sock, "  Found at kdata+0x%lx (VA 0x%lx)\n",
+                              ref_off, scan_addr + i);
+                xrefs++;
+            }
+        }
+        scan_addr += sizeof(scan_buf);
+    }
+    if (xrefs == 0) {
+        send_response(sock,
+            "  (none found - table may be inline, not referenced by pointer)\n");
+    } else {
+        send_response(sock, "  Total: %d cross-references\n", xrefs);
+    }
+
+    /* Highlight xapic_mode entry */
+    if (entries[2] >= text_start && entries[2] < text_end) {
+        send_response(sock, "\n*** xapic_mode (entry [2]) = ktext+0x%lx ***\n",
+                      entries[2] - text_start);
+        send_response(sock, "This is the resume-time target for HV bypass.\n");
+        send_response(sock, "Overwrite VA 0x%lx (kdata+0x%lx) with ROP gadget.\n",
+                      va + 16, offset + 16);
+    }
+
+    send_response(sock, "OK\n");
+}
+
 /* Display kernel information */
 static void
 cmd_kinfo(int sock) {
@@ -2114,6 +2260,8 @@ handle_command(int sock, char *cmd) {
         cmd_scan_apic_ops(sock, cmd + 14);
     } else if (strncmp(cmd, "identify_table ", 15) == 0) {
         cmd_identify_table(sock, cmd + 15);
+    } else if (strncmp(cmd, "analyze_apic_ops ", 17) == 0) {
+        cmd_analyze_apic_ops(sock, cmd + 17);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -2143,6 +2291,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "verify_xom               - Verify XOM boundaries + APIC state\n");
         send_response(sock, "scan_apic_ops [min]      - Find function pointer tables\n");
         send_response(sock, "identify_table <off> [ctx] - Identify func ptr table (kdata offset)\n");
+        send_response(sock, "analyze_apic_ops <off>   - Full apic_ops analysis (36 entries)\n");
         send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
