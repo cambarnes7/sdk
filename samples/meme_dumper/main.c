@@ -4667,48 +4667,81 @@ broad_done:
          * value.  If any CPU has IST7=0, a natural #GP on that CPU
          * sets RSP=0 → triple fault → kernel panic.
          *
-         * We use STRICT validation: rsvd0 must be 0 and RSP0 must be
-         * a valid kernel address.  We stop at the first invalid CPU.
-         * All validated CPUs get IST7 = ist_stack_top (not RSP0,
-         * which proved unreliable on PS5).
+         * THOROUGH validation for each per-CPU TSS candidate:
+         * - rsvd0 (offset 0x00) must be 0
+         * - rsp0 (0x04) must be kernel addr or -1 (HV sentinel)
+         * - rsp1 (0x0C) and rsp2 (0x14) must be 0
+         * - rsvd64 (0x64) must be 0
+         * This prevents false stride matches (stride=200 on PS5
+         * often aliases random kernel data that passes rsvd0+rsp0
+         * checks but fails the deeper structural checks).
+         *
+         * Only WRITE to TSSes that pass all checks.
          */
         {
             int idx = gp_ist_index - 1;
             uint64_t kaddr_min = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
             for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS && tss_stride > 0; cpu++) {
                 uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
-                uint32_t rsvd0;
-                uint64_t rsp0;
+                uint8_t tss_hdr[104]; /* full TSS for validation */
 
-                if (kernel_copyout(cpu_tss, &rsvd0, 4) != 0) {
+                if (kernel_copyout(cpu_tss, tss_hdr, sizeof(tss_hdr)) != 0) {
                     send_response(sock, "  CPU%d: read failed at 0x%lx\n",
                                   cpu, cpu_tss);
                     break;
                 }
+
+                uint32_t rsvd0;
+                uint64_t rsp0, rsp1, rsp2;
+                uint32_t rsvd64;
+                memcpy(&rsvd0,  tss_hdr + 0x00, 4);
+                memcpy(&rsp0,   tss_hdr + 0x04, 8);
+                memcpy(&rsp1,   tss_hdr + 0x0C, 8);
+                memcpy(&rsp2,   tss_hdr + 0x14, 8);
+                memcpy(&rsvd64, tss_hdr + 0x64, 4);
+
                 if (rsvd0 != 0) {
-                    send_response(sock, "  CPU%d: rsvd0=%u (not TSS), stopping\n",
+                    send_response(sock, "  CPU%d: rsvd0=%u, stopping\n",
                                   cpu, rsvd0);
                     break;
                 }
-                if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0 ||
-                    rsp0 == 0 ||
+                if (rsp0 == 0 ||
                     (rsp0 < kaddr_min &&
                      rsp0 != 0xFFFFFFFFFFFFFFFFULL)) {
-                    send_response(sock, "  CPU%d: rsp0=0x%lx (invalid), stopping\n",
+                    send_response(sock, "  CPU%d: rsp0=0x%lx (bad), stopping\n",
                                   cpu, rsp0);
                     break;
                 }
+                if (rsp1 != 0 || rsp2 != 0) {
+                    send_response(sock, "  CPU%d: rsp1=0x%lx rsp2=0x%lx "
+                                  "(not TSS), stopping\n",
+                                  cpu, rsp1, rsp2);
+                    break;
+                }
+                if (rsvd64 != 0) {
+                    send_response(sock, "  CPU%d: rsvd64=0x%x (not TSS), "
+                                  "stopping\n", cpu, rsvd64);
+                    break;
+                }
+
                 cpu_rsp0[cpu] = rsp0;
 
-                uint64_t ist_val = kernel_getlong(cpu_tss + 0x24 + idx * 8);
+                uint64_t ist_val;
+                memcpy(&ist_val, tss_hdr + 0x24 + idx * 8, 8);
                 ist_saved_percpu[cpu][idx] = ist_val;
                 num_cpus_found = cpu + 1;
 
-                send_response(sock, "  CPU%d TSS@0x%lx: rsp0=0x%lx IST%d=0x%lx\n",
-                              cpu, cpu_tss, rsp0, gp_ist_index, ist_val);
+                send_response(sock, "  CPU%d TSS@0x%lx: rsp0=0x%lx IST%d=0x%lx "
+                              "(rsp1=%lx rsp2=%lx rsvd64=%x) OK\n",
+                              cpu, cpu_tss, rsp0, gp_ist_index, ist_val,
+                              rsp1, rsp2, rsvd64);
             }
             send_response(sock, "  Validated %d CPU(s), IST%d saved\n",
                           num_cpus_found, gp_ist_index);
+            if (num_cpus_found < 1) {
+                send_response(sock, "  ERROR: no valid CPUs found, aborting\n");
+                goto step7_cleanup;
+            }
             if (num_cpus_found < 2) {
                 send_response(sock, "  WARNING: only %d CPU(s) validated "
                               "(IDT is shared across all CPUs!)\n"
