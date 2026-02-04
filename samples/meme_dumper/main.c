@@ -55,7 +55,9 @@ along with this program; see the file COPYING. If not, see
 /* FreeBSD pmap structure offsets (PS5 specific) */
 #define PMAP_OFFSET_PM_PML4    0x00
 #define PMAP_OFFSET_PM_CR3     0x08
-#define PMAP_OFFSET_DMAP_BASE  0x278
+/* DMAP base is calculated dynamically: dmap_base = pmap[0x20] - pmap[0x28] */
+#define PMAP_OFFSET_DMAP_VADDR 0x20   /* Contains a DMAP virtual address */
+#define PMAP_OFFSET_DMAP_PADDR 0x28   /* Contains corresponding physical address */
 
 /* pmap_store offset from kernel data base - FW 4.03 */
 #define PMAP_STORE_OFFSET      0x3257a78
@@ -110,6 +112,21 @@ notify(const char *msg) {
     bzero(&req, sizeof(req));
     strncpy(req.message, msg, sizeof(req.message) - 1);
     sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
+}
+
+/*
+ * Calculate DMAP base dynamically from pmap_store.
+ * DMAP base = (DMAP vaddr at offset 0x20) - (phys addr at offset 0x28)
+ */
+static uint64_t
+get_dmap_base(void) {
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
+
+    uint64_t dmap_vaddr = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_VADDR);
+    uint64_t dmap_paddr = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_PADDR);
+
+    return dmap_vaddr - dmap_paddr;
 }
 
 /* Send formatted response to client */
@@ -328,7 +345,7 @@ cmd_dump_pte(int sock, const char *args)
     intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
     intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
     uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
-    uint64_t dmap_base = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_BASE);
+    uint64_t dmap_base = get_dmap_base();
 
     send_response(sock, "=== Page Table Walk for VA 0x%lx ===\n", vaddr);
     send_response(sock, "pm_cr3: 0x%lx, DMAP: 0x%lx\n\n", pm_cr3, dmap_base);
@@ -377,7 +394,7 @@ cmd_scan_pte(int sock, const char *args)
     intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
     intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
     uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
-    uint64_t dmap_base = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_BASE);
+    uint64_t dmap_base = get_dmap_base();
 
     send_response(sock, "=== PTE Scan: 0x%lx + %lu entries (stride 0x%lx) ===\n",
                   start_vaddr, count, stride);
@@ -415,7 +432,7 @@ cmd_cmp_sections(int sock)
 
     intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
     uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
-    uint64_t dmap_base = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_BASE);
+    uint64_t dmap_base = get_dmap_base();
 
     send_response(sock, "=== Kernel Section Comparison ===\n\n");
 
@@ -459,7 +476,7 @@ cmd_probe_xom(int sock)
 
     intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
     uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
-    uint64_t dmap_base = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_BASE);
+    uint64_t dmap_base = get_dmap_base();
 
     send_response(sock, "=== XOM Probe Analysis ===\n\n");
 
@@ -619,7 +636,7 @@ cmd_kinfo(int sock) {
 
     uint64_t pm_pml4 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_PML4);
     uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
-    uint64_t dmap_base = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_BASE);
+    uint64_t dmap_base = get_dmap_base();
 
     send_response(sock, "=== PS5 Kernel Information ===\n");
     send_response(sock, "Firmware:        0x%08x (%d.%02d)\n",
@@ -687,10 +704,8 @@ cmd_dump_paddr(int sock, const char *args) {
         return;
     }
 
-    /* Get DMAP base from pmap_store */
-    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
-    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
-    uint64_t dmap_base = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_BASE);
+    /* Get DMAP base */
+    uint64_t dmap_base = get_dmap_base();
 
     if (dmap_base == 0) {
         send_response(sock, "ERROR: Failed to get DMAP base\n");
