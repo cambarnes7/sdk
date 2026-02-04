@@ -3273,11 +3273,11 @@ cmd_find_doreti_iret(int sock, const char *arg)
     if (have_text_pa) {
         send_response(sock, "ktext PA: 0x%lx (from page table walk)\n", text_pa);
         broad_start = (text_pa & ~0xFFFUL);
-        /* Without IDT we have no handler seeds, scan the full .text (16MB) */
+        /* Without IDT we have no handler seeds, scan wider */
         if (found_idt)
             broad_end = broad_start + 0x400000; /* 4MB */
         else
-            broad_end = broad_start + 0x1000000; /* 16MB */
+            broad_end = broad_start + 0x2000000; /* 32MB */
     } else {
         /* Use handler PA as anchor, scan wider range */
         send_response(sock, "ktext PA translation failed, using handler PA as anchor\n");
@@ -3296,8 +3296,8 @@ cmd_find_doreti_iret(int sock, const char *arg)
         broad_end = (anchor & ~0xFFFUL) + 0x400000;
     }
 
-    /* Cap: 4096 pages (16MB) without IDT, 2048 (8MB) with */
-    uint64_t max_pages = found_idt ? 2048 : 4096;
+    /* Cap: 8192 pages (32MB) without IDT, 2048 (8MB) with */
+    uint64_t max_pages = found_idt ? 2048 : 8192;
     if ((broad_end - broad_start) / 0x1000 > max_pages)
         broad_end = broad_start + max_pages * 0x1000;
 
@@ -3569,8 +3569,9 @@ broad_done:
      * exactly 2 bytes apart is a very strong signal.
      */
     if (broad_blocked > broad_readable && have_text_pa) {
-        send_response(sock, "\n--- Step 5c: Code Reference Scan (RIP-relative) ---\n");
-        send_response(sock, "Scanning readable .text for LEA [rip+disp] -> early .text\n");
+        send_response(sock, "\n--- Step 5c: Code Reference Scan ---\n");
+        send_response(sock, "Scanning readable .text for refs to early .text\n");
+        send_response(sock, "  patterns: LEA [rip+disp], MOV r64 imm32 (sign-ext)\n");
 
         uint64_t text_va_start = (uint64_t)ktext_base;
         uint64_t text_va_early = text_va_start + 0x100000; /* first 1MB */
@@ -3582,6 +3583,7 @@ broad_done:
         } code_refs[MAX_CODE_REFS];
         int num_code_refs = 0;
         int pages_scanned = 0;
+        int lea_hits = 0, mov_hits = 0;
 
         for (uint64_t pa = broad_start; pa < broad_end; pa += 0x1000) {
             if (kernel_copyout(dmap_base + pa, page_buf, sizeof(page_buf)) != 0)
@@ -3590,44 +3592,51 @@ broad_done:
             pages_scanned++;
             uint64_t page_va = text_va_start + (pa - text_pa);
 
-            if (pages_scanned % 256 == 0)
+            if (pages_scanned % 512 == 0)
                 send_response(sock, "  ...%d pages\n", pages_scanned);
 
-            /* Scan for REX.W LEA reg,[rip+disp32]: 48/4c 8d ModRM disp32 */
             for (size_t i = 0; i + 7 <= sizeof(page_buf); i++) {
                 uint8_t b0 = page_buf[i];
                 uint8_t b1 = page_buf[i + 1];
                 uint8_t b2 = page_buf[i + 2];
+                uint64_t target = 0;
 
-                /* REX.W (48) or REX.WR (4c) */
-                if (b0 != 0x48 && b0 != 0x4c)
-                    continue;
-                /* LEA opcode */
-                if (b1 != 0x8d)
-                    continue;
-                /* ModRM: mod=00, rm=101 => RIP-relative */
-                if ((b2 & 0xc7) != 0x05)
-                    continue;
+                if ((b0 == 0x48 || b0 == 0x4c) &&
+                    b1 == 0x8d && (b2 & 0xc7) == 0x05) {
+                    /* LEA reg, [rip+disp32] */
+                    int32_t disp;
+                    memcpy(&disp, &page_buf[i + 3], 4);
+                    target = (page_va + i) + 7 + (int64_t)disp;
+                    if (target >= text_va_start && target < text_va_early)
+                        lea_hits++;
+                    else
+                        target = 0;
+                } else if ((b0 == 0x48 || b0 == 0x49) &&
+                           b1 == 0xc7 && b2 >= 0xc0 && b2 <= 0xc7) {
+                    /* MOV r64, sign_extend(imm32) */
+                    int32_t imm32;
+                    memcpy(&imm32, &page_buf[i + 3], 4);
+                    target = (uint64_t)(int64_t)imm32;
+                    if (target >= text_va_start && target < text_va_early)
+                        mov_hits++;
+                    else
+                        target = 0;
+                }
 
-                int32_t disp;
-                memcpy(&disp, &page_buf[i + 3], 4);
-
-                uint64_t insn_va = page_va + i;
-                uint64_t target = insn_va + 7 + (int64_t)disp;
-
-                if (target < text_va_start || target >= text_va_early)
+                if (target == 0)
                     continue;
 
                 if (num_code_refs < MAX_CODE_REFS) {
                     code_refs[num_code_refs].target_va = target;
-                    code_refs[num_code_refs].ref_va = insn_va;
+                    code_refs[num_code_refs].ref_va = page_va + i;
                     num_code_refs++;
                 }
             }
         }
 
-        send_response(sock, "Scanned %d readable pages, found %d LEA refs to early .text\n",
-                      pages_scanned, num_code_refs);
+        send_response(sock, "Scanned %d readable pages, found %d refs "
+                      "(LEA: %d, MOV: %d)\n",
+                      pages_scanned, num_code_refs, lea_hits, mov_hits);
 
         if (num_code_refs >= MAX_CODE_REFS)
             send_response(sock, "  (hit limit of %d, some refs may be missing)\n",
