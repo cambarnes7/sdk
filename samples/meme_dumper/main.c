@@ -561,6 +561,52 @@ cmd_probe_xom(int sock)
     send_response(sock, "OK\n");
 }
 
+/*
+ * dump_pmap - Dump raw pmap_store structure to find correct offsets
+ */
+static void
+cmd_dump_pmap(int sock)
+{
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
+
+    send_response(sock, "=== Raw pmap_store dump ===\n");
+    send_response(sock, "kdata_base:  0x%lx\n", kdata_base);
+    send_response(sock, "pmap_store:  0x%lx (offset 0x%x)\n", pmap_store, PMAP_STORE_OFFSET);
+    send_response(sock, "\nSearching for DMAP-like values (0xffff9...):\n\n");
+
+    /* Dump first 0x400 bytes, showing non-zero and interesting values */
+    for (int i = 0; i < 0x400; i += 8) {
+        uint64_t val = kernel_getlong(pmap_store + i);
+
+        /* Show if: non-zero, or looks like DMAP base (0xffff9...) or kernel ptr */
+        if (val != 0) {
+            const char *hint = "";
+            if ((val >> 44) == 0xffff9) {
+                hint = " <-- POSSIBLE DMAP BASE!";
+            } else if ((val >> 32) == 0xffffffff) {
+                hint = " (kernel ptr)";
+            } else if ((val & 0xFFF) == 0 && val < 0x100000000UL && val != 0) {
+                hint = " (possible phys addr)";
+            }
+            send_response(sock, "+0x%03x: 0x%016lx%s\n", i, val, hint);
+        }
+    }
+
+    /* Also search for DMAP in nearby memory */
+    send_response(sock, "\n=== Searching kernel globals for DMAP ===\n");
+    /* Try some common offsets where DMAP might be stored */
+    uint64_t test_offsets[] = {0x3257878, 0x3257a70, 0x3257a80, 0x3257b00, 0x3258000};
+    for (int j = 0; j < 5; j++) {
+        uint64_t val = kernel_getlong(kdata_base + test_offsets[j]);
+        if ((val >> 44) == 0xffff9) {
+            send_response(sock, "FOUND at kdata+0x%lx: 0x%016lx\n", test_offsets[j], val);
+        }
+    }
+
+    send_response(sock, "OK\n");
+}
+
 /* Display kernel information */
 static void
 cmd_kinfo(int sock) {
@@ -687,6 +733,8 @@ handle_command(int sock, char *cmd) {
         cmd_cmp_sections(sock);
     } else if (strcmp(cmd, "probe_xom") == 0) {
         cmd_probe_xom(sock);
+    } else if (strcmp(cmd, "dump_pmap") == 0) {
+        cmd_dump_pmap(sock);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -700,6 +748,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "scan_pte <va> <n> [s]    - Scan PTEs for address range\n");
         send_response(sock, "cmp_sections             - Compare .text vs .data mappings\n");
         send_response(sock, "probe_xom                - Analyze XOM protection mechanism\n");
+        send_response(sock, "dump_pmap                - Debug: dump raw pmap_store structure\n");
         send_response(sock, "exit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
