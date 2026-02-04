@@ -40,12 +40,30 @@ along with this program; see the file COPYING. If not, see
 #include <stdarg.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
+#include <setjmp.h>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 #include <ps5/kernel.h>
+
+/* x86 CPU intrinsics for CPUID */
+static inline void
+do_cpuid(unsigned int ax, unsigned int *p)
+{
+    __asm__ __volatile__ ("cpuid"
+        : "=a" (p[0]), "=b" (p[1]), "=c" (p[2]), "=d" (p[3])
+        : "0" (ax), "c" (0));
+}
+
+/* APIC base address */
+#define DEFAULT_APIC_BASE       0xfee00000
+
+/* Signal handling for fault-safe probing */
+static sigjmp_buf probe_jmp_env;
+static volatile sig_atomic_t probe_fault_occurred;
 
 /* Server configuration */
 #define SERVER_PORT 9023
@@ -686,6 +704,501 @@ cmd_dump_pmap(int sock)
     send_response(sock, "OK\n");
 }
 
+/* =========================================================
+ * HV BYPASS RESEARCH COMMANDS
+ * ========================================================= */
+
+/*
+ * cpuid_info - Display CPU features relevant to HV bypass research
+ * Usage: cpuid_info
+ *
+ * Uses CPUID to understand the virtualization environment and AMD-V/SVM features.
+ * This is safe from userland and reveals HV configuration.
+ */
+static void
+cmd_cpuid_info(int sock)
+{
+    unsigned int regs[4];
+    char vendor[13] = {0};
+    char hv_vendor[13] = {0};
+
+    send_response(sock, "=== CPUID Analysis for HV Research ===\n\n");
+
+    /* Basic CPUID - Vendor ID */
+    do_cpuid(0, regs);
+    memcpy(&vendor[0], &regs[1], 4);  /* EBX */
+    memcpy(&vendor[4], &regs[3], 4);  /* EDX */
+    memcpy(&vendor[8], &regs[2], 4);  /* ECX */
+    send_response(sock, "CPU Vendor: %s\n", vendor);
+    send_response(sock, "Max CPUID leaf: 0x%x\n\n", regs[0]);
+
+    /* CPUID 1 - Feature flags */
+    do_cpuid(1, regs);
+    send_response(sock, "=== Feature Flags (CPUID.1) ===\n");
+    send_response(sock, "ECX: 0x%08x  EDX: 0x%08x\n", regs[2], regs[3]);
+    send_response(sock, "  VMX (Intel VT):     %s\n", (regs[2] & (1<<5)) ? "YES" : "NO");
+    send_response(sock, "  x2APIC:             %s\n", (regs[2] & (1<<21)) ? "YES" : "NO");
+    send_response(sock, "  Hypervisor present: %s\n", (regs[2] & (1<<31)) ? "YES" : "NO");
+
+    /* Hypervisor detection - CPUID 0x40000000 */
+    if (regs[2] & (1<<31)) {
+        do_cpuid(0x40000000, regs);
+        memcpy(&hv_vendor[0], &regs[1], 4);
+        memcpy(&hv_vendor[4], &regs[2], 4);
+        memcpy(&hv_vendor[8], &regs[3], 4);
+        send_response(sock, "\n=== Hypervisor Info ===\n");
+        send_response(sock, "HV Vendor ID: '%s'\n", hv_vendor);
+        send_response(sock, "Max HV leaf: 0x%x\n", regs[0]);
+
+        /* Try to get more HV info */
+        if (regs[0] >= 0x40000001) {
+            do_cpuid(0x40000001, regs);
+            send_response(sock, "HV Interface: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+                          regs[0], regs[1], regs[2], regs[3]);
+        }
+    }
+
+    /* AMD Extended Features - CPUID 0x80000001 */
+    do_cpuid(0x80000001, regs);
+    send_response(sock, "\n=== AMD Extended Features (0x80000001) ===\n");
+    send_response(sock, "ECX: 0x%08x  EDX: 0x%08x\n", regs[2], regs[3]);
+    send_response(sock, "  SVM (AMD-V):   %s\n", (regs[2] & (1<<2)) ? "YES" : "NO");
+    send_response(sock, "  NX bit:        %s\n", (regs[3] & (1<<20)) ? "YES" : "NO");
+    send_response(sock, "  1GB pages:     %s\n", (regs[3] & (1<<26)) ? "YES" : "NO");
+    send_response(sock, "  RDTSCP:        %s\n", (regs[3] & (1<<27)) ? "YES" : "NO");
+
+    /* AMD SVM Features - CPUID 0x8000000A */
+    do_cpuid(0x8000000A, regs);
+    send_response(sock, "\n=== AMD SVM Features (0x8000000A) ===\n");
+    send_response(sock, "SVM Rev: %d, NASID: %d\n", regs[0] & 0xFF, regs[1]);
+    send_response(sock, "EDX features: 0x%08x\n", regs[3]);
+    send_response(sock, "  NPT (Nested Paging):    %s\n", (regs[3] & (1<<0)) ? "YES" : "NO");
+    send_response(sock, "  LBR Virtualization:     %s\n", (regs[3] & (1<<1)) ? "YES" : "NO");
+    send_response(sock, "  SVM Lock:               %s\n", (regs[3] & (1<<2)) ? "YES" : "NO");
+    send_response(sock, "  NRIP Save:              %s\n", (regs[3] & (1<<3)) ? "YES" : "NO");
+    send_response(sock, "  TSC Rate MSR:           %s\n", (regs[3] & (1<<4)) ? "YES" : "NO");
+    send_response(sock, "  VMCB Clean:             %s\n", (regs[3] & (1<<5)) ? "YES" : "NO");
+    send_response(sock, "  Flush by ASID:          %s\n", (regs[3] & (1<<6)) ? "YES" : "NO");
+    send_response(sock, "  Decode Assists:         %s\n", (regs[3] & (1<<7)) ? "YES" : "NO");
+    send_response(sock, "  Pause Filter:           %s\n", (regs[3] & (1<<10)) ? "YES" : "NO");
+    send_response(sock, "  AVIC (AMD Virtual IC):  %s\n", (regs[3] & (1<<13)) ? "YES" : "NO");
+    send_response(sock, "  V_VMSAVE_VMLOAD:        %s\n", (regs[3] & (1<<15)) ? "YES" : "NO");
+    send_response(sock, "  VGIF:                   %s\n", (regs[3] & (1<<16)) ? "YES" : "NO");
+
+    send_response(sock, "\n=== Implications for HV Bypass ===\n");
+    send_response(sock, "If NPT=YES, XOM is likely enforced via nested page tables\n");
+    send_response(sock, "AVIC virtualization may offer timing attack surface\n");
+    send_response(sock, "OK\n");
+}
+
+/*
+ * scan_rwx - Scan for RWX (writable+executable) pages
+ * Usage: scan_rwx <start_vaddr> <end_vaddr> [stride]
+ *
+ * Scans page tables looking for pages where:
+ *   - NX=0 (executable) AND RW=1 (writable) -> true RWX
+ *   - These could be used to inject/execute code or contain unprotected copies
+ */
+static void
+cmd_scan_rwx(int sock, const char *args)
+{
+    unsigned long start_va, end_va, stride = 0x200000; /* Default 2MB stride */
+    uint64_t pm_cr3 = get_kernel_cr3();
+    uint64_t dmap_base = get_dmap_base();
+    int rwx_count = 0, exec_ro_count = 0, rw_nx_count = 0;
+    int scanned = 0;
+
+    if (sscanf(args, "%lx %lx %lx", &start_va, &end_va, &stride) < 2) {
+        send_response(sock, "Usage: scan_rwx <start_vaddr> <end_vaddr> [stride]\n");
+        send_response(sock, "Example: scan_rwx ffffffffc4800000 ffffffffc5000000 200000\n");
+        return;
+    }
+
+    if (stride == 0) stride = 0x200000;
+    if (end_va <= start_va) {
+        send_response(sock, "ERROR: end_vaddr must be > start_vaddr\n");
+        return;
+    }
+
+    send_response(sock, "=== RWX Page Scan: 0x%lx - 0x%lx ===\n", start_va, end_va);
+    send_response(sock, "Stride: 0x%lx, CR3: 0x%lx, DMAP: 0x%lx\n\n", stride, pm_cr3, dmap_base);
+    send_response(sock, "%-18s %-18s %-6s %-4s %-4s %-10s\n",
+                  "VADDR", "PADDR", "FLAGS", "RW", "NX", "TYPE");
+    send_response(sock, "--------------------------------------------------------------\n");
+
+    for (uint64_t va = start_va; va < end_va && scanned < 4096; va += stride) {
+        uint64_t paddr, flags;
+
+        if (vaddr_to_paddr_quiet(dmap_base, pm_cr3, va, &paddr, &flags) == 0) {
+            int is_exec = !(flags & PTE_NX);
+            int is_write = !!(flags & PTE_RW);
+
+            if (is_exec && is_write) {
+                /* True RWX - highest interest */
+                send_response(sock, "0x%016lx 0x%016lx 0x%04lx RW   X   **RWX**\n",
+                              va, paddr, flags & 0xFFF);
+                rwx_count++;
+            } else if (is_exec && !is_write) {
+                /* Execute-only or Read-Execute (potential XOM) */
+                exec_ro_count++;
+            } else if (!is_exec && is_write) {
+                /* Normal data page (RW, NX) */
+                rw_nx_count++;
+            }
+        }
+        scanned++;
+    }
+
+    send_response(sock, "\n=== Summary ===\n");
+    send_response(sock, "Pages scanned: %d\n", scanned);
+    send_response(sock, "RWX pages (bypass candidates): %d\n", rwx_count);
+    send_response(sock, "Exec+RO pages (XOM or code): %d\n", exec_ro_count);
+    send_response(sock, "RW+NX pages (normal data): %d\n", rw_nx_count);
+
+    if (rwx_count > 0) {
+        send_response(sock, "\n*** FOUND RWX PAGES - POTENTIAL BYPASS VECTORS! ***\n");
+    }
+    send_response(sock, "OK\n");
+}
+
+/*
+ * scan_code_sig - Search for kernel code signatures in accessible memory
+ * Usage: scan_code_sig [start_paddr] [size]
+ *
+ * Searches DMAP-accessible memory for byte patterns that match
+ * known kernel code sequences. May find unprotected copies of kernel code.
+ */
+static void
+cmd_scan_code_sig(int sock, const char *args)
+{
+    unsigned long start_pa = 0x1000000;   /* Start at 16MB by default */
+    unsigned long scan_size = 0x4000000;  /* 64MB default */
+    uint64_t dmap_base = get_dmap_base();
+    uint8_t buf[4096];
+    int matches = 0;
+    int chunks_read = 0;
+    int chunks_failed = 0;
+
+    /* Known kernel code signatures */
+    /* swapgs; mov %rsp, %gs:xxx - syscall entry */
+    static const uint8_t sig_swapgs[] = {0x0f, 0x01, 0xf8};
+    /* push %rbp; mov %rsp, %rbp - common function prologue */
+    static const uint8_t sig_prologue[] = {0x55, 0x48, 0x89, 0xe5};
+    /* cli - disable interrupts (kernel code) */
+    static const uint8_t sig_cli[] = {0xfa};
+    /* sti - enable interrupts */
+    static const uint8_t sig_sti[] = {0xfb};
+    /* iretq - interrupt return */
+    static const uint8_t sig_iretq[] = {0x48, 0xcf};
+
+    sscanf(args, "%lx %lx", &start_pa, &scan_size);
+
+    /* Limit scan size to prevent excessive runtime */
+    if (scan_size > 0x10000000) scan_size = 0x10000000;
+
+    send_response(sock, "=== Code Signature Scan ===\n");
+    send_response(sock, "Range: 0x%lx - 0x%lx (%lu MB)\n",
+                  start_pa, start_pa + scan_size, scan_size / (1024*1024));
+    send_response(sock, "DMAP base: 0x%lx\n", dmap_base);
+    send_response(sock, "Searching for kernel code patterns...\n\n");
+
+    for (uint64_t pa = start_pa; pa < start_pa + scan_size; pa += sizeof(buf)) {
+        uint64_t va = dmap_base + pa;
+
+        /* Try to read this chunk via kernel_copyout */
+        if (kernel_copyout(va, buf, sizeof(buf)) != 0) {
+            chunks_failed++;
+            continue;
+        }
+        chunks_read++;
+
+        /* Search for signatures in this chunk */
+        for (size_t i = 0; i < sizeof(buf) - 16; i++) {
+            /* Check swapgs signature (syscall entry) */
+            if (memcmp(&buf[i], sig_swapgs, sizeof(sig_swapgs)) == 0) {
+                send_response(sock, "MATCH: swapgs @ PA 0x%lx (DMAP 0x%lx)\n",
+                              pa + i, va + i);
+                matches++;
+                if (matches > 100) goto done;  /* Limit output */
+            }
+
+            /* Check iretq (interrupt/syscall return) */
+            if (memcmp(&buf[i], sig_iretq, sizeof(sig_iretq)) == 0) {
+                /* Verify it's likely real code (check surrounding bytes) */
+                if (i > 0 && (buf[i-1] == 0x48 || buf[i-1] == 0x41)) {
+                    send_response(sock, "MATCH: iretq @ PA 0x%lx\n", pa + i);
+                    matches++;
+                    if (matches > 100) goto done;
+                }
+            }
+        }
+    }
+
+done:
+    send_response(sock, "\n=== Summary ===\n");
+    send_response(sock, "Chunks read: %d, failed: %d\n", chunks_read, chunks_failed);
+    send_response(sock, "Code signature matches: %d\n", matches);
+
+    if (matches > 0 && chunks_failed == 0) {
+        send_response(sock, "\n*** WARNING: Found code patterns in readable memory! ***\n");
+        send_response(sock, "These may be unprotected copies of kernel code.\n");
+    } else if (chunks_failed > chunks_read) {
+        send_response(sock, "\nMost memory is not DMAP-accessible (HV protected)\n");
+    }
+    send_response(sock, "OK\n");
+}
+
+/*
+ * msr_dump - Dump MSR values from kernel data structures
+ * Usage: msr_dump
+ *
+ * Reads MSR values that the kernel has cached, since rdmsr
+ * requires Ring 0 and would #GP from userland.
+ */
+static void
+cmd_msr_dump(int sock)
+{
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+
+    send_response(sock, "=== MSR Values from Kernel Structures ===\n\n");
+    send_response(sock, "NOTE: Direct rdmsr requires Ring 0.\n");
+    send_response(sock, "Scanning kernel .data for MSR-like values...\n\n");
+
+    /* Look for EFER-like values: typical value is 0xD01 (LME|LMA|SCE|NXE) */
+    send_response(sock, "=== Searching for EFER (0xC0000080) pattern ===\n");
+    send_response(sock, "Expected: 0xD01 (LMA|LME|SCE) or 0xD00 | SVME\n\n");
+
+    int efer_candidates = 0;
+    for (uint64_t offset = 0; offset < 0x200000 && efer_candidates < 20; offset += 8) {
+        uint64_t val = kernel_getlong(kdata_base + offset);
+
+        /* EFER typical pattern: low bits set, upper bits zero */
+        if ((val & 0xFFFFFFFFFFFF0000UL) == 0 &&
+            (val & 0xD01) == 0xD01 &&           /* LMA, LME, SCE must be set */
+            (val & 0xFFFFF000) == 0 &&          /* Upper bits clear */
+            val != 0) {
+            send_response(sock, "Possible EFER @ kdata+0x%lx: 0x%lx", offset, val);
+            if (val & 0x1000) send_response(sock, " [SVME]");
+            send_response(sock, "\n");
+            efer_candidates++;
+        }
+    }
+
+    /* Look for LSTAR (syscall entry point) - should be kernel address */
+    send_response(sock, "\n=== Searching for LSTAR (0xC0000082) pattern ===\n");
+    send_response(sock, "Expected: 0xffffffff8xxxxxxx (kernel .text address)\n\n");
+
+    intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+    int lstar_candidates = 0;
+    for (uint64_t offset = 0; offset < 0x200000 && lstar_candidates < 10; offset += 8) {
+        uint64_t val = kernel_getlong(kdata_base + offset);
+
+        /* LSTAR should be in kernel .text range */
+        if ((val >> 32) == 0xffffffff &&
+            val >= (uint64_t)ktext_base &&
+            val < (uint64_t)ktext_base + 0x2000000) {
+            send_response(sock, "Possible LSTAR @ kdata+0x%lx: 0x%lx\n", offset, val);
+            lstar_candidates++;
+        }
+    }
+
+    /* Look for CR3-like values (physical PML4 address) */
+    send_response(sock, "\n=== Searching for CR3 pattern ===\n");
+    send_response(sock, "Expected: page-aligned physical address < 4GB\n\n");
+
+    int cr3_candidates = 0;
+    for (uint64_t offset = 0; offset < 0x200000 && cr3_candidates < 10; offset += 8) {
+        uint64_t val = kernel_getlong(kdata_base + offset);
+
+        /* CR3 should be page-aligned, non-zero, reasonable physical address */
+        if ((val & 0xFFF) == 0 &&
+            val > 0x100000 &&
+            val < 0x100000000UL) {
+            /* Verify it looks like a valid PML4 by checking entry 511 */
+            uint64_t pml4e_511 = kernel_getlong(get_dmap_base() + val + (511 * 8));
+            if (pml4e_511 & PTE_P) {
+                send_response(sock, "Possible CR3 @ kdata+0x%lx: 0x%lx (PML4E[511]=0x%lx)\n",
+                              offset, val, pml4e_511);
+                cr3_candidates++;
+            }
+        }
+    }
+
+    send_response(sock, "OK\n");
+}
+
+/*
+ * probe_signal_handler - Signal handler for fault-safe probing
+ */
+static void
+probe_signal_handler(int sig)
+{
+    (void)sig;
+    probe_fault_occurred = 1;
+    siglongjmp(probe_jmp_env, 1);
+}
+
+/*
+ * probe_dmap - Test DMAP physical address accessibility (fault-safe)
+ * Usage: probe_dmap <start_paddr> <end_paddr> [stride]
+ *
+ * Uses signal handling to safely test if physical addresses
+ * are readable via DMAP without causing kernel panic.
+ *
+ * WARNING: HV-triggered faults may not be catchable via signals.
+ */
+static void
+cmd_probe_dmap(int sock, const char *args)
+{
+    unsigned long start_pa, end_pa, stride = 0x200000; /* 2MB default */
+    struct sigaction sa, old_sigsegv, old_sigbus;
+    uint64_t dmap_base = get_dmap_base();
+    int accessible = 0, blocked = 0;
+    int probed = 0;
+
+    if (sscanf(args, "%lx %lx %lx", &start_pa, &end_pa, &stride) < 2) {
+        send_response(sock, "Usage: probe_dmap <start_paddr> <end_paddr> [stride]\n");
+        send_response(sock, "Example: probe_dmap 0 4000000 200000\n");
+        return;
+    }
+
+    if (stride == 0) stride = 0x200000;
+    if (end_pa <= start_pa) {
+        send_response(sock, "ERROR: end_paddr must be > start_paddr\n");
+        return;
+    }
+
+    /* Setup signal handlers for fault recovery */
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = probe_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    sigaction(SIGSEGV, &sa, &old_sigsegv);
+    sigaction(SIGBUS, &sa, &old_sigbus);
+
+    send_response(sock, "=== DMAP Accessibility Probe: 0x%lx - 0x%lx ===\n",
+                  start_pa, end_pa);
+    send_response(sock, "DMAP base: 0x%lx, Stride: 0x%lx\n", dmap_base, stride);
+    send_response(sock, "WARNING: HV faults may still cause panic!\n\n");
+
+    for (uint64_t pa = start_pa; pa < end_pa && probed < 1024; pa += stride) {
+        uint64_t va = dmap_base + pa;
+        uint64_t val;
+
+        probe_fault_occurred = 0;
+
+        if (sigsetjmp(probe_jmp_env, 1) == 0) {
+            /* Try to read - may fault */
+            if (kernel_copyout(va, &val, sizeof(val)) == 0) {
+                send_response(sock, "0x%012lx: READABLE (val=0x%016lx)\n", pa, val);
+                accessible++;
+            } else {
+                send_response(sock, "0x%012lx: COPYOUT_FAILED\n", pa);
+                blocked++;
+            }
+        } else {
+            /* Returned from signal handler - fault occurred */
+            send_response(sock, "0x%012lx: FAULT (signal caught)\n", pa);
+            blocked++;
+        }
+        probed++;
+    }
+
+    /* Restore original signal handlers */
+    sigaction(SIGSEGV, &old_sigsegv, NULL);
+    sigaction(SIGBUS, &old_sigbus, NULL);
+
+    send_response(sock, "\n=== Summary ===\n");
+    send_response(sock, "Probed: %d, Accessible: %d, Blocked: %d\n",
+                  probed, accessible, blocked);
+    send_response(sock, "OK\n");
+}
+
+/*
+ * apic_probe - Probe Local APIC registers via DMAP
+ * Usage: apic_probe
+ *
+ * The APIC at physical 0xfee00000 is memory-mapped. If accessible:
+ * - Could reveal HV interception patterns
+ * - Understanding APIC virtualization is key for timing attacks
+ */
+static void
+cmd_apic_probe(int sock)
+{
+    uint64_t dmap_base = get_dmap_base();
+    uint64_t apic_paddr = DEFAULT_APIC_BASE;  /* 0xfee00000 */
+    uint64_t apic_vaddr = dmap_base + apic_paddr;
+    uint32_t val;
+
+    /* APIC register offsets and names */
+    struct {
+        uint32_t offset;
+        const char *name;
+    } apic_regs[] = {
+        {0x020, "LAPIC_ID"},
+        {0x030, "LAPIC_VERSION"},
+        {0x080, "TPR"},
+        {0x090, "APR"},
+        {0x0A0, "PPR"},
+        {0x0B0, "EOI"},
+        {0x0C0, "RRD"},
+        {0x0D0, "LDR"},
+        {0x0E0, "DFR"},
+        {0x0F0, "SVR"},
+        {0x100, "ISR0"},
+        {0x200, "IRR0"},
+        {0x280, "ESR"},
+        {0x300, "ICR_LO"},
+        {0x310, "ICR_HI"},
+        {0x320, "LVT_TIMER"},
+        {0x330, "LVT_THERMAL"},
+        {0x340, "LVT_PERF"},
+        {0x350, "LVT_LINT0"},
+        {0x360, "LVT_LINT1"},
+        {0x370, "LVT_ERROR"},
+        {0x380, "TIMER_ICR"},
+        {0x390, "TIMER_CCR"},
+        {0x3E0, "TIMER_DCR"},
+    };
+
+    send_response(sock, "=== APIC Probe via DMAP ===\n");
+    send_response(sock, "APIC physical: 0x%lx\n", apic_paddr);
+    send_response(sock, "DMAP address: 0x%lx\n\n", apic_vaddr);
+    send_response(sock, "WARNING: APIC access may be HV-virtualized or blocked\n\n");
+
+    int readable = 0, failed = 0;
+
+    for (int i = 0; i < (int)(sizeof(apic_regs)/sizeof(apic_regs[0])); i++) {
+        uint64_t reg_addr = apic_vaddr + apic_regs[i].offset;
+
+        if (kernel_copyout(reg_addr, &val, sizeof(val)) == 0) {
+            send_response(sock, "%-12s [0x%03x]: 0x%08x\n",
+                          apic_regs[i].name, apic_regs[i].offset, val);
+            readable++;
+        } else {
+            send_response(sock, "%-12s [0x%03x]: READ FAILED\n",
+                          apic_regs[i].name, apic_regs[i].offset);
+            failed++;
+        }
+    }
+
+    send_response(sock, "\n=== Analysis ===\n");
+    send_response(sock, "Registers readable: %d, failed: %d\n", readable, failed);
+
+    if (readable > 0) {
+        send_response(sock, "\nAPIC is accessible via DMAP!\n");
+        send_response(sock, "This could enable:\n");
+        send_response(sock, "  - Timer-based side channel attacks\n");
+        send_response(sock, "  - IPI injection analysis\n");
+        send_response(sock, "  - HV interception timing measurements\n");
+    } else {
+        send_response(sock, "\nAPIC is NOT accessible - likely HV protected\n");
+    }
+
+    send_response(sock, "OK\n");
+}
+
 /* Display kernel information */
 static void
 cmd_kinfo(int sock) {
@@ -811,6 +1324,21 @@ handle_command(int sock, char *cmd) {
         cmd_dump_pmap(sock);
     } else if (strcmp(cmd, "find_kcr3") == 0) {
         cmd_find_kcr3(sock);
+    /* HV Bypass Research Commands */
+    } else if (strcmp(cmd, "cpuid_info") == 0) {
+        cmd_cpuid_info(sock);
+    } else if (strncmp(cmd, "scan_rwx ", 9) == 0) {
+        cmd_scan_rwx(sock, cmd + 9);
+    } else if (strcmp(cmd, "scan_code_sig") == 0) {
+        cmd_scan_code_sig(sock, "");
+    } else if (strncmp(cmd, "scan_code_sig ", 14) == 0) {
+        cmd_scan_code_sig(sock, cmd + 14);
+    } else if (strcmp(cmd, "msr_dump") == 0) {
+        cmd_msr_dump(sock);
+    } else if (strncmp(cmd, "probe_dmap ", 11) == 0) {
+        cmd_probe_dmap(sock, cmd + 11);
+    } else if (strcmp(cmd, "apic_probe") == 0) {
+        cmd_apic_probe(sock);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -824,9 +1352,16 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "scan_pte <va> <n> [s]    - Scan PTEs for address range\n");
         send_response(sock, "cmp_sections             - Compare .text vs .data mappings\n");
         send_response(sock, "find_kcr3                - Search for kernel CR3/PML4\n");
-        send_response(sock, "probe_xom                - Analyze XOM protection mechanism\n");
-        send_response(sock, "dump_pmap                - Debug: dump raw pmap_store structure\n");
-        send_response(sock, "exit                     - Close connection\n");
+        send_response(sock, "probe_xom                - Analyze XOM protection (safe)\n");
+        send_response(sock, "dump_pmap                - Debug: dump raw pmap_store\n");
+        send_response(sock, "\n=== HV Bypass Research ===\n");
+        send_response(sock, "cpuid_info               - CPU/HV feature detection\n");
+        send_response(sock, "scan_rwx <start> <end>   - Find RWX pages\n");
+        send_response(sock, "scan_code_sig [pa] [sz]  - Search for code patterns\n");
+        send_response(sock, "msr_dump                 - Find cached MSR values\n");
+        send_response(sock, "probe_dmap <start> <end> - Fault-safe DMAP probe\n");
+        send_response(sock, "apic_probe               - APIC register analysis\n");
+        send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
         send_response(sock, "ERROR: Unknown command '%s'. Type 'help' for commands.\n", cmd);
