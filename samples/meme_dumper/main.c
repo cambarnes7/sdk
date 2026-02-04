@@ -2846,11 +2846,30 @@ cmd_dump_idt(int sock)
  *   5. Classifies candidates by proximity to #GP and swapgs presence
  */
 static void
-cmd_find_doreti_iret(int sock)
+cmd_find_doreti_iret(int sock, const char *arg)
 {
     intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
     uint64_t pm_cr3 = get_kernel_cr3();
     uint64_t dmap_base = get_dmap_base();
+
+    send_response(sock, "=== Phase 7b: doreti_iret Finder ===\n\n");
+
+    /* If user provided a known ktext offset, use it directly */
+    if (arg && *arg) {
+        uint64_t offset = strtoull(arg, NULL, 16);
+        if (offset > 0 && offset < 0x2000000) {
+            uint64_t va = (uint64_t)ktext_base + offset;
+            send_response(sock, "Using provided offset: ktext+0x%lx\n", offset);
+            send_response(sock, "\n*** doreti_iret = 0x%lx (ktext+0x%lx) ***\n", va, offset);
+            send_response(sock, "Confidence: USER-PROVIDED\n");
+            send_response(sock, "\nNotes:\n");
+            send_response(sock, "  Phase 7c will redirect #DB to singlestep "
+                          "through this instruction\n");
+            send_response(sock, "OK\n");
+            return;
+        }
+        send_response(sock, "WARNING: invalid offset '%s', proceeding with scan\n\n", arg);
+    }
 
     /* Byte signatures */
     static const uint8_t sig_iretq[]  = {0x48, 0xcf};
@@ -2882,8 +2901,6 @@ cmd_find_doreti_iret(int sock)
         {13,  "#GP GenProt",     0, 0, 0, 0, 0},
     };
 
-    send_response(sock, "=== Phase 7b: doreti_iret Finder ===\n\n");
-
     /* ---- Step 0: Symbol Table Lookup ---- */
     /*
      * Search .data for the ELF string "doreti_iret", then locate the
@@ -2893,16 +2910,20 @@ cmd_find_doreti_iret(int sock)
     send_response(sock, "--- Step 0: Symbol Table Lookup ---\n");
     {
         uint64_t data_start = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
-        uint64_t data_size  = 0x2000000; /* 32MB */
+        uint64_t data_size  = 0x8000000; /* 128MB - covers .data + .bss + metadata */
         uint8_t sbuf[4096];
         uint64_t string_addr = 0;
 
-        send_response(sock, "Searching .data for 'doreti_iret' string...\n");
+        send_response(sock, "Searching 128MB for 'doreti_iret' string...\n");
 
         /* Part A: Find "\0doreti_iret\0" in .data (strtab entry) */
         for (uint64_t addr = data_start;
              addr < data_start + data_size && !string_addr;
              addr += sizeof(sbuf)) {
+            int chunk = (int)((addr - data_start) / sizeof(sbuf));
+            if (chunk % 8192 == 0)
+                send_response(sock, "  ...%luMB\n",
+                              (unsigned long)((addr - data_start) / (1024 * 1024)));
             if (kernel_copyout(addr, sbuf, sizeof(sbuf)) != 0)
                 continue;
 
@@ -3060,7 +3081,10 @@ cmd_find_doreti_iret(int sock)
             send_response(sock, "Symbol entry not found (%d candidates examined)\n",
                           sym_candidates);
         } else {
-            send_response(sock, "'doreti_iret' string not found in .data\n");
+            send_response(sock, "'doreti_iret' string not found in 128MB\n");
+            send_response(sock, "Kernel appears stripped (no symbol table).\n");
+            send_response(sock, "TIP: use 'find_doreti_iret <ktext_offset_hex>' with "
+                          "a known offset from your firmware's offset database.\n");
         }
 
         send_response(sock, "Falling through to scan-based approach...\n\n");
@@ -3797,7 +3821,9 @@ handle_command(int sock, char *cmd) {
     } else if (strcmp(cmd, "dump_idt") == 0) {
         cmd_dump_idt(sock);
     } else if (strcmp(cmd, "find_doreti_iret") == 0) {
-        cmd_find_doreti_iret(sock);
+        cmd_find_doreti_iret(sock, NULL);
+    } else if (strncmp(cmd, "find_doreti_iret ", 17) == 0) {
+        cmd_find_doreti_iret(sock, cmd + 17);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -3831,7 +3857,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "find_cfi_targets         - Find CFI-valid function targets\n");
         send_response(sock, "idt_diag                 - IDT diagnostic (relaxed gate scan, 64MB)\n");
         send_response(sock, "dump_idt                 - Dump IDT (handlers, IST, types)\n");
-        send_response(sock, "find_doreti_iret         - Find doreti_iret gadget in kernel .text\n");
+        send_response(sock, "find_doreti_iret [off]   - Find doreti_iret (or use known ktext offset)\n");
         send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
