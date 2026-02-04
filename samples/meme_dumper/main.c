@@ -4122,6 +4122,12 @@ broad_done:
                         base_safe = 1; /* in DMAP (first 4GB) */
                     if (!base_safe) {
                         ridt_candidates_rejected++;
+                        if (ridt_candidates_rejected <= 5)
+                            send_response(sock,
+                                "  r_idt reject #%d: base=0x%lx "
+                                "align=%s\n",
+                                ridt_candidates_rejected, base,
+                                (base & 0xFFF) ? "no" : "PAGE");
                         continue;
                     }
 
