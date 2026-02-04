@@ -4101,6 +4101,15 @@ broad_done:
                     if (base < 0xFFFF800000000000ULL)
                         continue;
 
+                    /* Safety: only probe base addresses within the
+                     * .data scan range we know is readable. Reading
+                     * from arbitrary kernel addresses can panic. */
+                    if (base < kdata || base + 4096 > kdata + scan_size)
+                        continue;
+                    /* IDT is page-aligned */
+                    if (base & 0xFFF)
+                        continue;
+
                     /* Candidate r_idt: validate by reading IDT gates */
                     uint8_t gates[64]; /* first 4 entries */
                     if (kernel_copyout(base, gates, 64) != 0)
@@ -4144,6 +4153,56 @@ broad_done:
                             "base=0x%lx (CS=0x%04x)\n",
                             addr + off - kdata, limit,
                             base, sel);
+                    }
+                }
+            }
+
+            /* Fallback: direct IDT gate pattern scan (no selector check).
+             * This catches the case where the IDT is in .data but r_idt
+             * is not (e.g., HV-loaded IDT, or r_idt outside scan range).
+             * Uses the same relaxed validation as above. */
+            if (!idt_found) {
+                send_response(sock, "  r_idt not found; scanning for "
+                              "IDT gate patterns...\n");
+                for (uint64_t addr = kdata;
+                     addr < kdata + scan_size && !idt_found;
+                     addr += 4096) {
+                    if (kernel_copyout(addr, page, 4096) != 0)
+                        continue;
+
+                    /* Check offset 0: first 4 entries at page start */
+                    int valid = 0;
+                    for (int v = 0; v < 4; v++) {
+                        uint8_t *g = page + v * 16;
+                        if (!(g[5] & 0x80))
+                            continue;
+                        uint8_t type = g[5] & 0x0F;
+                        if (type != 14 && type != 15)
+                            continue;
+                        uint32_t rsvd;
+                        memcpy(&rsvd, g + 12, 4);
+                        if (rsvd != 0)
+                            continue;
+                        uint64_t h = (uint64_t)g[0] |
+                                     ((uint64_t)g[1] << 8) |
+                                     ((uint64_t)g[6] << 16) |
+                                     ((uint64_t)g[7] << 24) |
+                                     ((uint64_t)g[8] << 32) |
+                                     ((uint64_t)g[9] << 40) |
+                                     ((uint64_t)g[10] << 48) |
+                                     ((uint64_t)g[11] << 56);
+                        if (h >= ktext && h < ktext + 0x2000000)
+                            valid++;
+                    }
+                    if (valid >= 3) {
+                        idt_base = addr;
+                        idt_found = 1;
+                        uint16_t sel;
+                        memcpy(&sel, page + 2, 2);
+                        send_response(sock,
+                            "  IDT gates at kdata+0x%lx (%d/4 valid, "
+                            "CS=0x%04x)\n",
+                            addr - kdata, valid, sel);
                     }
                 }
             }
