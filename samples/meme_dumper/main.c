@@ -1377,12 +1377,23 @@ cmd_map_xom_boundary(int sock, const char *args)
     send_response(sock, "OK\n");
 }
 
+/* Comparison function for qsort */
+static int
+cmp_uint64(const void *a, const void *b)
+{
+    uint64_t va = *(const uint64_t *)a;
+    uint64_t vb = *(const uint64_t *)b;
+    if (va < vb) return -1;
+    if (va > vb) return 1;
+    return 0;
+}
+
 /*
  * timing_probe - Accurate timing measurement for specific physical address
  * Usage: timing_probe <paddr> [samples]
  *
  * Measures memory access timing with proper wraparound handling.
- * Reports min/max/avg statistics for detailed analysis.
+ * Reports min/max/median/avg statistics. Median is robust to outliers.
  */
 static void
 cmd_timing_probe(int sock, const char *args)
@@ -1427,6 +1438,7 @@ cmd_timing_probe(int sock, const char *args)
 
         if (result != 0) {
             failures++;
+            times[i] = UINT64_MAX;  /* Mark failed reads */
             continue;
         }
         successes++;
@@ -1454,17 +1466,23 @@ cmd_timing_probe(int sock, const char *args)
 
     send_response(sock, "\n=== Statistics ===\n");
     if (successes > 0) {
+        /* Sort times to get median */
+        qsort(times, num_samples, sizeof(uint64_t), cmp_uint64);
+
+        /* Find median (skip UINT64_MAX entries which are at the end after sort) */
+        uint64_t median = times[successes / 2];
+
         uint64_t avg = total / successes;
         send_response(sock, "Successful reads: %d/%d\n", successes, num_samples);
         send_response(sock, "Min:     %lu cycles\n", (unsigned long)min_time);
-        send_response(sock, "Max:     %lu cycles\n", (unsigned long)max_time);
+        send_response(sock, "Median:  %lu cycles  <-- use this (robust to outliers)\n", (unsigned long)median);
         send_response(sock, "Average: %lu cycles\n", (unsigned long)avg);
-        send_response(sock, "Range:   %lu cycles\n", (unsigned long)(max_time - min_time));
+        send_response(sock, "Max:     %lu cycles\n", (unsigned long)max_time);
 
-        /* Classify the timing */
-        if (avg < 200) {
+        /* Classify based on MEDIAN, not average */
+        if (median < 200) {
             send_response(sock, "\nClassification: NORMAL (fast DMAP access)\n");
-        } else if (avg < 10000) {
+        } else if (median < 10000) {
             send_response(sock, "\nClassification: SLOW (possible cache miss or contention)\n");
         } else {
             send_response(sock, "\nClassification: VERY SLOW (possible HV intercept or MMIO)\n");
@@ -1486,6 +1504,7 @@ cmd_timing_probe(int sock, const char *args)
  *
  * Uses known XOM boundaries from map_xom_boundary to measure
  * timing differences near the protected region.
+ * Uses MEDIAN for robust statistics (immune to timer wraparound outliers).
  */
 static void
 cmd_timing_boundary(int sock)
@@ -1516,20 +1535,21 @@ cmd_timing_boundary(int sock)
     };
 
     int num_points = sizeof(test_points) / sizeof(test_points[0]);
-    int samples = 20;
+    int samples = 50;  /* More samples for better median */
 
     send_response(sock, "=== XOM Boundary Timing Analysis ===\n");
     send_response(sock, "XOM region: PA 0x%lx - 0x%lx\n", xom_start, xom_end);
-    send_response(sock, "Samples per point: %d\n\n", samples);
+    send_response(sock, "Samples per point: %d (using MEDIAN)\n\n", samples);
     send_response(sock, "%-30s %-12s %-10s %-10s %-10s\n",
-                  "Location", "PA", "Min", "Avg", "Status");
+                  "Location", "PA", "Min", "Median", "Status");
     send_response(sock, "--------------------------------------------------------------------\n");
 
     for (int t = 0; t < num_points; t++) {
         uint64_t paddr = test_points[t].paddr;
         uint64_t va = dmap_base + paddr;
 
-        uint64_t min_time = UINT64_MAX, total = 0;
+        uint64_t times[50];
+        uint64_t min_time = UINT64_MAX;
         int successes = 0;
 
         for (int i = 0; i < samples; i++) {
@@ -1537,7 +1557,10 @@ cmd_timing_boundary(int sock)
             int result = kernel_copyout(va, &val, 8);
             kernel_copyout(apic_vaddr + 0x390, &timer_end, 4);
 
-            if (result != 0) continue;
+            if (result != 0) {
+                times[i] = UINT64_MAX;
+                continue;
+            }
             successes++;
 
             uint64_t delta;
@@ -1547,17 +1570,20 @@ cmd_timing_boundary(int sock)
                 delta = timer_start - timer_end;
             }
 
-            total += delta;
+            times[i] = delta;
             if (delta < min_time) min_time = delta;
         }
 
         if (successes > 0) {
-            uint64_t avg = total / successes;
-            const char *status = (avg < 200) ? "FAST" :
-                                 (avg < 10000) ? "SLOW" : "VERY SLOW";
+            /* Sort to get median */
+            qsort(times, samples, sizeof(uint64_t), cmp_uint64);
+            uint64_t median = times[successes / 2];
+
+            const char *status = (median < 200) ? "FAST" :
+                                 (median < 10000) ? "SLOW" : "VERY SLOW";
             send_response(sock, "%-30s 0x%-10lx %-10lu %-10lu %s\n",
                           test_points[t].desc, paddr,
-                          (unsigned long)min_time, (unsigned long)avg, status);
+                          (unsigned long)min_time, (unsigned long)median, status);
         } else {
             send_response(sock, "%-30s 0x%-10lx %-10s %-10s BLOCKED\n",
                           test_points[t].desc, paddr, "-", "-");
@@ -1566,7 +1592,109 @@ cmd_timing_boundary(int sock)
 
     send_response(sock, "\n=== Analysis ===\n");
     send_response(sock, "Compare timing at XOM-4KB vs 8MB baseline.\n");
-    send_response(sock, "Large difference suggests HV pre-emptive checking.\n");
+    send_response(sock, "If similar (~140-180 cycles), no HV pre-emptive checking.\n");
+    send_response(sock, "OK\n");
+}
+
+/*
+ * verify_xom - Re-verify XOM boundaries with detailed analysis
+ * Usage: verify_xom
+ *
+ * Performs thorough check of XOM region to confirm boundaries
+ * and detect any anomalies from previous scans.
+ */
+static void
+cmd_verify_xom(int sock)
+{
+    uint64_t dmap_base = get_dmap_base();
+
+    /* Expected XOM boundaries from previous map_xom_boundary */
+    uint64_t expected_start = 0xa700000;
+    uint64_t expected_end = 0xb300000;
+
+    send_response(sock, "=== XOM Boundary Verification ===\n");
+    send_response(sock, "Expected XOM: PA 0x%lx - 0x%lx\n\n", expected_start, expected_end);
+
+    /* Test points around boundaries */
+    struct {
+        uint64_t paddr;
+        const char *desc;
+        int expect_blocked;
+    } tests[] = {
+        {expected_start - 0x2000, "2 pages before XOM", 0},
+        {expected_start - 0x1000, "1 page before XOM", 0},
+        {expected_start,          "XOM start", 1},
+        {expected_start + 0x1000, "XOM start + 4KB", 1},
+        {expected_start + 0x100000, "XOM start + 1MB", 1},
+        {expected_end - 0x1000,   "XOM end - 4KB", 1},
+        {expected_end,            "XOM end", 0},
+        {expected_end + 0x1000,   "1 page after XOM", 0},
+    };
+
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+    int passed = 0, failed = 0;
+
+    send_response(sock, "%-25s %-12s %-10s %-10s %-10s\n",
+                  "Location", "PA", "Expected", "Actual", "Result");
+    send_response(sock, "---------------------------------------------------------------\n");
+
+    for (int i = 0; i < num_tests; i++) {
+        uint64_t va = dmap_base + tests[i].paddr;
+        uint8_t buf[8];
+
+        /* Try multiple reads to be sure */
+        int blocked_count = 0;
+        for (int j = 0; j < 5; j++) {
+            if (kernel_copyout(va, buf, sizeof(buf)) != 0) {
+                blocked_count++;
+            }
+        }
+
+        int is_blocked = (blocked_count >= 3);  /* Majority vote */
+        int expected = tests[i].expect_blocked;
+        int match = (is_blocked == expected);
+
+        const char *exp_str = expected ? "BLOCKED" : "OK";
+        const char *act_str = is_blocked ? "BLOCKED" : "OK";
+        const char *res_str = match ? "PASS" : "FAIL";
+
+        send_response(sock, "%-25s 0x%-10lx %-10s %-10s %-10s\n",
+                      tests[i].desc, tests[i].paddr, exp_str, act_str, res_str);
+
+        if (match) passed++;
+        else failed++;
+    }
+
+    send_response(sock, "\n=== Summary ===\n");
+    send_response(sock, "Passed: %d/%d\n", passed, num_tests);
+
+    if (failed > 0) {
+        send_response(sock, "FAILED: %d - XOM boundaries may have changed!\n", failed);
+        send_response(sock, "Run 'map_xom_boundary' to re-scan.\n");
+    } else {
+        send_response(sock, "All tests passed - XOM boundaries confirmed.\n");
+    }
+
+    /* Also show APIC timer state */
+    uint64_t apic_vaddr = dmap_base + DEFAULT_APIC_BASE;
+    uint32_t icr, ccr, dcr;
+
+    kernel_copyout(apic_vaddr + 0x380, &icr, 4);  /* Initial Count */
+    kernel_copyout(apic_vaddr + 0x390, &ccr, 4);  /* Current Count */
+    kernel_copyout(apic_vaddr + 0x3e0, &dcr, 4);  /* Divide Config */
+
+    send_response(sock, "\n=== APIC Timer State ===\n");
+    send_response(sock, "ICR (Initial Count):  0x%08x (%u)\n", icr, icr);
+    send_response(sock, "CCR (Current Count):  0x%08x (%u)\n", ccr, ccr);
+    send_response(sock, "DCR (Divide Config):  0x%08x\n", dcr);
+
+    if (icr == 0) {
+        send_response(sock, "WARNING: ICR=0 means timer is not running in periodic mode.\n");
+        send_response(sock, "Timer wraparound happens whenever CCR reaches 0.\n");
+    } else {
+        send_response(sock, "Timer period: %u cycles before wraparound.\n", icr);
+    }
+
     send_response(sock, "OK\n");
 }
 
@@ -1720,6 +1848,8 @@ handle_command(int sock, char *cmd) {
         cmd_timing_probe(sock, cmd + 13);
     } else if (strcmp(cmd, "timing_boundary") == 0) {
         cmd_timing_boundary(sock);
+    } else if (strcmp(cmd, "verify_xom") == 0) {
+        cmd_verify_xom(sock);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -1746,6 +1876,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "map_xom_boundary [s] [e] - Find XOM region boundaries\n");
         send_response(sock, "timing_probe <pa> [n]    - Time reads at PA (n samples)\n");
         send_response(sock, "timing_boundary          - Time reads at XOM boundary\n");
+        send_response(sock, "verify_xom               - Verify XOM boundaries + APIC state\n");
         send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
