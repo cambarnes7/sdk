@@ -62,6 +62,9 @@ along with this program; see the file COPYING. If not, see
 /* pmap_store offset from kernel data base - FW 4.03 */
 #define PMAP_STORE_OFFSET      0x3257a78
 
+/* Kernel CR3 (KPML4phys) - 8 bytes before pmap_store */
+#define KERNEL_CR3_OFFSET      0x3257a70
+
 /* x86-64 Page Table Constants */
 #define PAGE_SHIFT_4K       12
 #define PAGE_SIZE_4K        (1UL << PAGE_SHIFT_4K)
@@ -127,6 +130,16 @@ get_dmap_base(void) {
     uint64_t dmap_paddr = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_PADDR);
 
     return dmap_vaddr - dmap_paddr;
+}
+
+/*
+ * Get the kernel's CR3 (physical address of kernel PML4).
+ * This is stored at KERNEL_CR3_OFFSET, NOT in pmap_store.
+ */
+static uint64_t
+get_kernel_cr3(void) {
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    return kernel_getlong(kdata_base + KERNEL_CR3_OFFSET);
 }
 
 /* Send formatted response to client */
@@ -342,13 +355,11 @@ cmd_dump_pte(int sock, const char *args)
         return;
     }
 
-    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
-    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
-    uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
+    uint64_t pm_cr3 = get_kernel_cr3();
     uint64_t dmap_base = get_dmap_base();
 
     send_response(sock, "=== Page Table Walk for VA 0x%lx ===\n", vaddr);
-    send_response(sock, "pm_cr3: 0x%lx, DMAP: 0x%lx\n\n", pm_cr3, dmap_base);
+    send_response(sock, "Kernel CR3: 0x%lx, DMAP: 0x%lx\n\n", pm_cr3, dmap_base);
 
     if (vaddr_to_paddr(sock, vaddr, dmap_base, pm_cr3, &paddr, &pte_flags) == 0) {
         send_response(sock, "\n=== Translation Result ===\n");
@@ -391,9 +402,7 @@ cmd_scan_pte(int sock, const char *args)
     if (stride == 0) stride = 0x1000;
     if (count > 256) count = 256;
 
-    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
-    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
-    uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
+    uint64_t pm_cr3 = get_kernel_cr3();
     uint64_t dmap_base = get_dmap_base();
 
     send_response(sock, "=== PTE Scan: 0x%lx + %lu entries (stride 0x%lx) ===\n",
@@ -430,8 +439,7 @@ cmd_cmp_sections(int sock)
     uint64_t text_paddr = 0, text_flags = 0;
     uint64_t data_paddr = 0, data_flags = 0;
 
-    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
-    uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
+    uint64_t pm_cr3 = get_kernel_cr3();
     uint64_t dmap_base = get_dmap_base();
 
     send_response(sock, "=== Kernel Section Comparison ===\n\n");
@@ -471,11 +479,9 @@ static void
 cmd_probe_xom(int sock)
 {
     intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
-    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
     uint64_t text_paddr = 0, text_flags = 0;
 
-    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
-    uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
+    uint64_t pm_cr3 = get_kernel_cr3();
     uint64_t dmap_base = get_dmap_base();
 
     send_response(sock, "=== XOM Probe Analysis ===\n\n");
@@ -726,11 +732,9 @@ cmd_kinfo(int sock) {
     intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
     uint32_t fw_version = kernel_get_fw_version();
 
-    /* Read pmap_store structure */
+    /* Read kernel info */
     intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
-
-    uint64_t pm_pml4 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_PML4);
-    uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
+    uint64_t pm_cr3 = get_kernel_cr3();
     uint64_t dmap_base = get_dmap_base();
 
     send_response(sock, "=== PS5 Kernel Information ===\n");
@@ -743,8 +747,7 @@ cmd_kinfo(int sock) {
     send_response(sock, "\n=== PMAP Information ===\n");
     send_response(sock, "pmap_store:      0x%lx\n", pmap_store);
     send_response(sock, "pmap_offset:     0x%x\n", PMAP_STORE_OFFSET);
-    send_response(sock, "pm_pml4:         0x%lx\n", pm_pml4);
-    send_response(sock, "pm_cr3:          0x%lx\n", pm_cr3);
+    send_response(sock, "Kernel CR3:      0x%lx (KPML4phys @ kdata+0x%x)\n", pm_cr3, KERNEL_CR3_OFFSET);
     send_response(sock, "DMAP base:       0x%lx\n", dmap_base);
     send_response(sock, "\n=== Security Flags ===\n");
     send_response(sock, "TARGETID:        0x%02x\n", kernel_getchar(KERNEL_ADDRESS_TARGETID));
