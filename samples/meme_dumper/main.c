@@ -2958,7 +2958,7 @@ cmd_find_doreti_iret(int sock)
 
                 for (int i = 0; i <= (int)sizeof(sbuf) - 24; i += 8) {
                     uint32_t st_name;
-                    uint8_t  st_info, st_other;
+                    uint8_t  st_other;
                     uint16_t st_shndx;
                     uint64_t st_value, st_size;
 
@@ -2970,7 +2970,6 @@ cmd_find_doreti_iret(int sock)
                         continue;
 
                     memcpy(&st_name, sbuf + i, 4);
-                    st_info  = sbuf[i + 4];
                     st_other = sbuf[i + 5];
                     memcpy(&st_shndx, sbuf + i + 6, 2);
                     memcpy(&st_size, sbuf + i + 16, 8);
