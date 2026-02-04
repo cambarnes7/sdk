@@ -42,6 +42,7 @@ along with this program; see the file COPYING. If not, see
 #include <errno.h>
 #include <signal.h>
 #include <setjmp.h>
+#include <stdint.h>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
