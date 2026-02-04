@@ -2884,6 +2884,189 @@ cmd_find_doreti_iret(int sock)
 
     send_response(sock, "=== Phase 7b: doreti_iret Finder ===\n\n");
 
+    /* ---- Step 0: Symbol Table Lookup ---- */
+    /*
+     * Search .data for the ELF string "doreti_iret", then locate the
+     * corresponding Elf64_Sym entry to read the symbol's virtual address.
+     * This bypasses XOM entirely - no .text reads needed.
+     */
+    send_response(sock, "--- Step 0: Symbol Table Lookup ---\n");
+    {
+        uint64_t data_start = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+        uint64_t data_size  = 0x2000000; /* 32MB */
+        uint8_t sbuf[4096];
+        uint64_t string_addr = 0;
+
+        send_response(sock, "Searching .data for 'doreti_iret' string...\n");
+
+        /* Part A: Find "\0doreti_iret\0" in .data (strtab entry) */
+        for (uint64_t addr = data_start;
+             addr < data_start + data_size && !string_addr;
+             addr += sizeof(sbuf)) {
+            if (kernel_copyout(addr, sbuf, sizeof(sbuf)) != 0)
+                continue;
+
+            for (int i = 1; i <= (int)sizeof(sbuf) - 12; i++) {
+                if (sbuf[i] != 'd')
+                    continue;
+                if (memcmp(sbuf + i, "doreti_iret", 11) != 0)
+                    continue;
+                /* Check null before and after */
+                if (sbuf[i - 1] != 0)
+                    continue;
+                if (i + 11 < (int)sizeof(sbuf) && sbuf[i + 11] != 0)
+                    continue;
+                string_addr = addr + i;
+                break;
+            }
+        }
+
+        if (string_addr) {
+            send_response(sock, "Found 'doreti_iret' at 0x%lx (kdata+0x%lx)\n",
+                          string_addr, string_addr - data_start);
+
+            /* Check for "doreti_iret_fault" right after (strtab adjacency) */
+            int have_fault_str = 0;
+            uint8_t after[20];
+            if (kernel_copyout(string_addr + 12, after, 18) == 0) {
+                if (memcmp(after, "doreti_iret_fault", 17) == 0)
+                    have_fault_str = 1;
+            }
+            if (have_fault_str)
+                send_response(sock, "  'doreti_iret_fault' adjacent in strtab [good]\n");
+
+            /* Part B: Find Elf64_Sym entry for this string.
+             *   Elf64_Sym (24 bytes):
+             *     [0..3]   st_name  (uint32 - offset into strtab)
+             *     [4]      st_info  [5] st_other  [6..7] st_shndx
+             *     [8..15]  st_value (uint64 - symbol address)
+             *     [16..23] st_size  (uint64)
+             */
+            send_response(sock, "Searching for Elf64_Sym entry...\n");
+
+            uint64_t doreti_va = 0;
+            uint64_t doreti_fault_va = 0;
+            int sym_candidates = 0;
+
+            for (uint64_t addr = data_start;
+                 addr < data_start + data_size;
+                 addr += sizeof(sbuf)) {
+                if (doreti_va && have_fault_str)
+                    break; /* found with strong verification */
+                if (kernel_copyout(addr, sbuf, sizeof(sbuf)) != 0)
+                    continue;
+
+                for (int i = 0; i <= (int)sizeof(sbuf) - 24; i += 8) {
+                    uint32_t st_name;
+                    uint8_t  st_info, st_other;
+                    uint16_t st_shndx;
+                    uint64_t st_value, st_size;
+
+                    memcpy(&st_value, sbuf + i + 8, 8);
+
+                    /* Quick filter: st_value must be in ktext range */
+                    if (st_value < (uint64_t)ktext_base ||
+                        st_value >= (uint64_t)ktext_base + 0x2000000)
+                        continue;
+
+                    memcpy(&st_name, sbuf + i, 4);
+                    st_info  = sbuf[i + 4];
+                    st_other = sbuf[i + 5];
+                    memcpy(&st_shndx, sbuf + i + 6, 2);
+                    memcpy(&st_size, sbuf + i + 16, 8);
+
+                    /* Validate Elf64_Sym fields */
+                    if (st_name == 0 || st_name > 0x1000000)
+                        continue;
+                    if (st_other != 0 && st_other != 2)
+                        continue;
+                    if (st_shndx == 0 || st_shndx >= 0xff00)
+                        continue;
+                    if (st_size > 0x1000)
+                        continue;
+
+                    /* Compute strtab_base = string_addr - st_name */
+                    uint64_t strtab_base = string_addr - (uint64_t)st_name;
+                    if (strtab_base < data_start ||
+                        strtab_base >= data_start + data_size)
+                        continue;
+
+                    /* Verify: strtab[0] must be '\0' */
+                    uint8_t first;
+                    if (kernel_copyout(strtab_base, &first, 1) != 0 ||
+                        first != 0)
+                        continue;
+
+                    sym_candidates++;
+                    send_response(sock,
+                        "  sym: st_name=%u st_value=0x%lx (ktext+0x%lx) "
+                        "st_size=%lu strtab=0x%lx\n",
+                        st_name, st_value,
+                        st_value - (uint64_t)ktext_base,
+                        (unsigned long)st_size, strtab_base);
+
+                    doreti_va = st_value;
+
+                    /* If doreti_iret_fault string is adjacent, find its sym too */
+                    if (have_fault_str && !doreti_fault_va) {
+                        /* doreti_iret_fault string is at string_addr+12 */
+                        uint32_t fault_st_name = st_name + 12;
+                        /* Search nearby in symtab for this entry */
+                        int search_start = (i >= 240) ? i - 240 : 0;
+                        int search_end = (i + 264 <= (int)sizeof(sbuf) - 24) ?
+                                         i + 264 : (int)sizeof(sbuf) - 24;
+                        for (int j = search_start; j <= search_end; j += 8) {
+                            if (j == i) continue;
+                            uint32_t fn;
+                            uint64_t fv;
+                            memcpy(&fn, sbuf + j, 4);
+                            memcpy(&fv, sbuf + j + 8, 8);
+                            if (fn == fault_st_name &&
+                                fv >= (uint64_t)ktext_base &&
+                                fv < (uint64_t)ktext_base + 0x2000000) {
+                                doreti_fault_va = fv;
+                                send_response(sock,
+                                    "  doreti_iret_fault: 0x%lx (ktext+0x%lx)\n",
+                                    fv, fv - (uint64_t)ktext_base);
+                                break;
+                            }
+                        }
+                    }
+
+                    if (have_fault_str && doreti_fault_va)
+                        break; /* high confidence */
+                }
+            }
+
+            if (doreti_va) {
+                send_response(sock, "\n*** doreti_iret = 0x%lx (ktext+0x%lx) ***\n",
+                              doreti_va, doreti_va - (uint64_t)ktext_base);
+                if (doreti_fault_va)
+                    send_response(sock,
+                        "*** doreti_iret_fault = 0x%lx (ktext+0x%lx) ***\n",
+                        doreti_fault_va,
+                        doreti_fault_va - (uint64_t)ktext_base);
+                send_response(sock, "Confidence: %s\n",
+                              (have_fault_str && doreti_fault_va) ? "HIGH" :
+                              have_fault_str ? "MEDIUM" : "LOW");
+
+                send_response(sock, "\nNotes:\n");
+                send_response(sock, "  Address found via ELF symbol table in .data\n");
+                send_response(sock, "  Phase 7c will redirect #DB to singlestep "
+                              "through this instruction\n");
+                send_response(sock, "OK\n");
+                return; /* success - skip all other steps */
+            }
+
+            send_response(sock, "Symbol entry not found (%d candidates examined)\n",
+                          sym_candidates);
+        } else {
+            send_response(sock, "'doreti_iret' string not found in .data\n");
+        }
+
+        send_response(sock, "Falling through to scan-based approach...\n\n");
+    }
+
     /* ---- Step 1: IDT Discovery (gate descriptor pattern scan) ---- */
     send_response(sock, "--- Step 1: IDT Discovery ---\n");
 
