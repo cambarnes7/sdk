@@ -45,8 +45,12 @@ along with this program; see the file COPYING. If not, see
 #include <stdint.h>
 
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <threads.h>
+#include <ucontext.h>
 
 #include <ps5/kernel.h>
 
