@@ -2472,7 +2472,6 @@ static void
 cmd_dump_idt(int sock)
 {
     intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
-    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
     uint64_t text_start = (uint64_t)ktext_base;
     uint64_t text_end = text_start + 0x1000000;
 
@@ -2646,7 +2645,6 @@ static void
 cmd_find_doreti_iret(int sock)
 {
     intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
-    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
     uint64_t pm_cr3 = get_kernel_cr3();
     uint64_t dmap_base = get_dmap_base();
 
