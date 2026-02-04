@@ -1698,6 +1698,111 @@ cmd_verify_xom(int sock)
     send_response(sock, "OK\n");
 }
 
+/*
+ * scan_apic_ops - Search for apic_ops and similar function pointer tables
+ * Usage: scan_apic_ops [min_ptrs]
+ *
+ * Scans kernel .data for consecutive pointers into .text range.
+ * The apic_ops structure contains function pointers that can be
+ * hijacked during suspend/resume to execute code before HV restarts.
+ */
+static void
+cmd_scan_apic_ops(int sock, const char *args)
+{
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+
+    /* Scan parameters */
+    int min_ptrs = 4;  /* Minimum consecutive pointers to report */
+    if (args && *args) {
+        sscanf(args, "%d", &min_ptrs);
+    }
+    if (min_ptrs < 2) min_ptrs = 2;
+    if (min_ptrs > 20) min_ptrs = 20;
+
+    /* Define kernel .text range (approximate) */
+    uint64_t text_start = (uint64_t)ktext_base;
+    uint64_t text_end = text_start + 0x1000000;  /* ~16MB .text */
+
+    /* Scan range in .data */
+    uint64_t scan_start = (uint64_t)kdata_base;
+    uint64_t scan_size = 0x1000000;  /* Scan 16MB of .data */
+
+    send_response(sock, "=== Scanning for Function Pointer Tables ===\n");
+    send_response(sock, "Looking for %d+ consecutive .text pointers in .data\n", min_ptrs);
+    send_response(sock, ".text range: 0x%lx - 0x%lx\n", text_start, text_end);
+    send_response(sock, ".data scan:  0x%lx - 0x%lx\n\n", scan_start, scan_start + scan_size);
+
+    int tables_found = 0;
+    uint64_t addr = scan_start;
+
+    while (addr < scan_start + scan_size - (min_ptrs * 8)) {
+        /* Read a qword */
+        uint64_t val;
+        if (kernel_copyout(addr, &val, sizeof(val)) != 0) {
+            addr += 8;
+            continue;
+        }
+
+        /* Check if it's a .text pointer */
+        if (val >= text_start && val < text_end) {
+            /* Found a potential start - count consecutive pointers */
+            int count = 1;
+            uint64_t ptrs[20];
+            ptrs[0] = val;
+
+            for (int i = 1; i < 20; i++) {
+                uint64_t next_val;
+                if (kernel_copyout(addr + i * 8, &next_val, sizeof(next_val)) != 0) {
+                    break;
+                }
+                if (next_val >= text_start && next_val < text_end) {
+                    ptrs[i] = next_val;
+                    count++;
+                } else {
+                    break;
+                }
+            }
+
+            if (count >= min_ptrs) {
+                tables_found++;
+                uint64_t offset = addr - (uint64_t)kdata_base;
+                send_response(sock, "=== Table #%d at kdata+0x%lx (VA 0x%lx) ===\n",
+                              tables_found, offset, addr);
+                send_response(sock, "Consecutive .text pointers: %d\n", count);
+
+                for (int i = 0; i < count && i < 10; i++) {
+                    uint64_t ptr_offset = ptrs[i] - text_start;
+                    send_response(sock, "  [%d] 0x%lx (ktext+0x%lx)\n", i, ptrs[i], ptr_offset);
+                }
+                if (count > 10) {
+                    send_response(sock, "  ... and %d more\n", count - 10);
+                }
+                send_response(sock, "\n");
+
+                /* Skip past this table */
+                addr += count * 8;
+                continue;
+            }
+        }
+        addr += 8;
+    }
+
+    send_response(sock, "=== Summary ===\n");
+    send_response(sock, "Tables found: %d\n", tables_found);
+
+    if (tables_found > 0) {
+        send_response(sock, "\nTo exploit apic_ops:\n");
+        send_response(sock, "1. Identify which table is apic_ops (look for ~10-15 ptrs)\n");
+        send_response(sock, "2. Find a ROP gadget that passes CFI\n");
+        send_response(sock, "3. Overwrite a function pointer (e.g., index 0 or 1)\n");
+        send_response(sock, "4. Trigger suspend/resume cycle\n");
+        send_response(sock, "5. Code executes before HV restarts\n");
+    }
+
+    send_response(sock, "OK\n");
+}
+
 /* Display kernel information */
 static void
 cmd_kinfo(int sock) {
@@ -1850,6 +1955,10 @@ handle_command(int sock, char *cmd) {
         cmd_timing_boundary(sock);
     } else if (strcmp(cmd, "verify_xom") == 0) {
         cmd_verify_xom(sock);
+    } else if (strcmp(cmd, "scan_apic_ops") == 0) {
+        cmd_scan_apic_ops(sock, "");
+    } else if (strncmp(cmd, "scan_apic_ops ", 14) == 0) {
+        cmd_scan_apic_ops(sock, cmd + 14);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -1877,6 +1986,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "timing_probe <pa> [n]    - Time reads at PA (n samples)\n");
         send_response(sock, "timing_boundary          - Time reads at XOM boundary\n");
         send_response(sock, "verify_xom               - Verify XOM boundaries + APIC state\n");
+        send_response(sock, "scan_apic_ops [min]      - Find function pointer tables\n");
         send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
