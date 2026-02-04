@@ -27,6 +27,10 @@ along with this program; see the file COPYING. If not, see
  *   dump_base   - Dump 1MB from kernel .data base
  *   dump_vaddr <addr> <size> - Dump memory from virtual address
  *   dump_paddr <addr> <size> - Dump memory from physical address via DMAP
+ *   dump_pte <vaddr>         - Walk page tables for virtual address
+ *   scan_pte <va> <n> [s]    - Scan PTEs for address range
+ *   cmp_sections             - Compare .text vs .data page mappings
+ *   probe_xom                - Analyze XOM protection mechanism
  *   exit        - Close connection
  */
 
@@ -55,6 +59,42 @@ along with this program; see the file COPYING. If not, see
 
 /* pmap_store offset from kernel data base - FW 4.03 */
 #define PMAP_STORE_OFFSET      0x3257a78
+
+/* x86-64 Page Table Constants */
+#define PAGE_SHIFT_4K       12
+#define PAGE_SIZE_4K        (1UL << PAGE_SHIFT_4K)
+#define PAGE_MASK_4K        (PAGE_SIZE_4K - 1)
+
+#define PDRSHIFT            21      /* 2MB page */
+#define PDPSHIFT            30      /* 1GB page */
+#define PML4SHIFT           39
+
+/* Page sizes for large pages */
+#define NBPDR               (1UL << PDRSHIFT)   /* 2MB */
+#define NBPDP               (1UL << PDPSHIFT)   /* 1GB */
+
+/* Page table entry flags */
+#define PTE_P               0x001   /* Present */
+#define PTE_RW              0x002   /* Read/Write */
+#define PTE_US              0x004   /* User/Supervisor */
+#define PTE_PWT             0x008   /* Write-Through */
+#define PTE_PCD             0x010   /* Cache Disable */
+#define PTE_A               0x020   /* Accessed */
+#define PTE_D               0x040   /* Dirty */
+#define PTE_PS              0x080   /* Page Size (2MB or 1GB) */
+#define PTE_G               0x100   /* Global */
+#define PTE_NX              (1UL << 63)  /* No Execute */
+
+/* Physical address masks */
+#define PTE_FRAME           0x000FFFFFFFFFF000UL  /* 4KB page frame */
+#define PDE_PS_FRAME        0x000FFFFFFFE00000UL  /* 2MB page frame */
+#define PDPE_PS_FRAME       0x000FFFFFC0000000UL  /* 1GB page frame */
+
+/* Extract page table indices from virtual address */
+#define PML4_INDEX(va)      (((va) >> PML4SHIFT) & 0x1FF)
+#define PDP_INDEX(va)       (((va) >> PDPSHIFT) & 0x1FF)
+#define PD_INDEX(va)        (((va) >> PDRSHIFT) & 0x1FF)
+#define PT_INDEX(va)        (((va) >> PAGE_SHIFT_4K) & 0x1FF)
 
 /* Notification support */
 typedef struct notify_request {
@@ -123,6 +163,402 @@ dump_memory(int sock, intptr_t addr, size_t size) {
     free(buf);
     send_response(sock, "\nDUMP_END\n");
     return ret;
+}
+
+/*
+ * Walk page tables to translate virtual address to physical address (verbose)
+ * Returns 0 on success, -1 on failure
+ */
+static int
+vaddr_to_paddr(int sock, uint64_t vaddr, uint64_t dmap_base, uint64_t pm_cr3,
+               uint64_t *paddr_out, uint64_t *pte_flags_out)
+{
+    uint64_t pml4e, pdpe, pde, pte;
+    uint64_t pml4_paddr, pdp_paddr, pd_paddr, pt_paddr;
+    uint64_t pml4_idx, pdp_idx, pd_idx, pt_idx;
+    uint64_t page_offset;
+
+    /* Extract indices from virtual address */
+    pml4_idx = PML4_INDEX(vaddr);
+    pdp_idx = PDP_INDEX(vaddr);
+    pd_idx = PD_INDEX(vaddr);
+    pt_idx = PT_INDEX(vaddr);
+
+    send_response(sock, "  VA: 0x%lx -> indices: PML4[%lu] PDP[%lu] PD[%lu] PT[%lu]\n",
+                  vaddr, pml4_idx, pdp_idx, pd_idx, pt_idx);
+
+    /* Step 1: Read PML4 entry */
+    pml4_paddr = (pm_cr3 & PTE_FRAME) + (pml4_idx * 8);
+    pml4e = kernel_getlong(dmap_base + pml4_paddr);
+
+    send_response(sock, "  PML4E[%lu] @ paddr 0x%lx = 0x%lx\n",
+                  pml4_idx, pml4_paddr, pml4e);
+
+    if (!(pml4e & PTE_P)) {
+        send_response(sock, "  ERROR: PML4E not present\n");
+        return -1;
+    }
+
+    /* Step 2: Read PDP entry */
+    pdp_paddr = (pml4e & PTE_FRAME) + (pdp_idx * 8);
+    pdpe = kernel_getlong(dmap_base + pdp_paddr);
+
+    send_response(sock, "  PDPE[%lu] @ paddr 0x%lx = 0x%lx\n",
+                  pdp_idx, pdp_paddr, pdpe);
+
+    if (!(pdpe & PTE_P)) {
+        send_response(sock, "  ERROR: PDPE not present\n");
+        return -1;
+    }
+
+    /* Check for 1GB huge page */
+    if (pdpe & PTE_PS) {
+        page_offset = vaddr & (NBPDP - 1);
+        *paddr_out = (pdpe & PDPE_PS_FRAME) + page_offset;
+        if (pte_flags_out) *pte_flags_out = pdpe;
+        send_response(sock, "  1GB page: paddr = 0x%lx (flags=0x%lx)\n",
+                      *paddr_out, pdpe & 0xFFF);
+        return 0;
+    }
+
+    /* Step 3: Read PD entry */
+    pd_paddr = (pdpe & PTE_FRAME) + (pd_idx * 8);
+    pde = kernel_getlong(dmap_base + pd_paddr);
+
+    send_response(sock, "  PDE[%lu] @ paddr 0x%lx = 0x%lx\n",
+                  pd_idx, pd_paddr, pde);
+
+    if (!(pde & PTE_P)) {
+        send_response(sock, "  ERROR: PDE not present\n");
+        return -1;
+    }
+
+    /* Check for 2MB huge page */
+    if (pde & PTE_PS) {
+        page_offset = vaddr & (NBPDR - 1);
+        *paddr_out = (pde & PDE_PS_FRAME) + page_offset;
+        if (pte_flags_out) *pte_flags_out = pde;
+        send_response(sock, "  2MB page: paddr = 0x%lx (flags=0x%lx)\n",
+                      *paddr_out, pde & 0xFFF);
+        return 0;
+    }
+
+    /* Step 4: Read PT entry (4KB page) */
+    pt_paddr = (pde & PTE_FRAME) + (pt_idx * 8);
+    pte = kernel_getlong(dmap_base + pt_paddr);
+
+    send_response(sock, "  PTE[%lu] @ paddr 0x%lx = 0x%lx\n",
+                  pt_idx, pt_paddr, pte);
+
+    if (!(pte & PTE_P)) {
+        send_response(sock, "  ERROR: PTE not present\n");
+        return -1;
+    }
+
+    page_offset = vaddr & PAGE_MASK_4K;
+    *paddr_out = (pte & PTE_FRAME) + page_offset;
+    if (pte_flags_out) *pte_flags_out = pte;
+
+    send_response(sock, "  4KB page: paddr = 0x%lx (flags=0x%lx)\n",
+                  *paddr_out, pte & 0xFFF);
+    return 0;
+}
+
+/*
+ * Walk page tables quietly (no output) for scanning
+ */
+static int
+vaddr_to_paddr_quiet(uint64_t dmap_base, uint64_t pm_cr3, uint64_t vaddr,
+                     uint64_t *paddr_out, uint64_t *pte_flags_out)
+{
+    uint64_t pml4e, pdpe, pde, pte;
+    uint64_t page_offset;
+
+    /* PML4 */
+    pml4e = kernel_getlong(dmap_base + (pm_cr3 & PTE_FRAME) + (PML4_INDEX(vaddr) * 8));
+    if (!(pml4e & PTE_P)) return -1;
+
+    /* PDP */
+    pdpe = kernel_getlong(dmap_base + (pml4e & PTE_FRAME) + (PDP_INDEX(vaddr) * 8));
+    if (!(pdpe & PTE_P)) return -1;
+
+    if (pdpe & PTE_PS) {
+        page_offset = vaddr & (NBPDP - 1);
+        *paddr_out = (pdpe & PDPE_PS_FRAME) + page_offset;
+        if (pte_flags_out) *pte_flags_out = pdpe;
+        return 0;
+    }
+
+    /* PD */
+    pde = kernel_getlong(dmap_base + (pdpe & PTE_FRAME) + (PD_INDEX(vaddr) * 8));
+    if (!(pde & PTE_P)) return -1;
+
+    if (pde & PTE_PS) {
+        page_offset = vaddr & (NBPDR - 1);
+        *paddr_out = (pde & PDE_PS_FRAME) + page_offset;
+        if (pte_flags_out) *pte_flags_out = pde;
+        return 0;
+    }
+
+    /* PT */
+    pte = kernel_getlong(dmap_base + (pde & PTE_FRAME) + (PT_INDEX(vaddr) * 8));
+    if (!(pte & PTE_P)) return -1;
+
+    page_offset = vaddr & PAGE_MASK_4K;
+    *paddr_out = (pte & PTE_FRAME) + page_offset;
+    if (pte_flags_out) *pte_flags_out = pte;
+    return 0;
+}
+
+/*
+ * dump_pte - Walk page tables for a virtual address
+ * Usage: dump_pte <vaddr>
+ */
+static void
+cmd_dump_pte(int sock, const char *args)
+{
+    unsigned long vaddr;
+    uint64_t paddr, pte_flags;
+
+    if (sscanf(args, "%lx", &vaddr) != 1) {
+        send_response(sock, "ERROR: Usage: dump_pte <vaddr>\n");
+        return;
+    }
+
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
+    uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
+    uint64_t dmap_base = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_BASE);
+
+    send_response(sock, "=== Page Table Walk for VA 0x%lx ===\n", vaddr);
+    send_response(sock, "pm_cr3: 0x%lx, DMAP: 0x%lx\n\n", pm_cr3, dmap_base);
+
+    if (vaddr_to_paddr(sock, vaddr, dmap_base, pm_cr3, &paddr, &pte_flags) == 0) {
+        send_response(sock, "\n=== Translation Result ===\n");
+        send_response(sock, "VA 0x%lx -> PA 0x%lx\n", vaddr, paddr);
+        send_response(sock, "Flags: P=%d RW=%d US=%d PWT=%d PCD=%d A=%d D=%d PS=%d G=%d NX=%d\n",
+                      !!(pte_flags & PTE_P),
+                      !!(pte_flags & PTE_RW),
+                      !!(pte_flags & PTE_US),
+                      !!(pte_flags & PTE_PWT),
+                      !!(pte_flags & PTE_PCD),
+                      !!(pte_flags & PTE_A),
+                      !!(pte_flags & PTE_D),
+                      !!(pte_flags & PTE_PS),
+                      !!(pte_flags & PTE_G),
+                      !!(pte_flags & PTE_NX));
+
+        /* Check if this is execute-only (NX=0, RW=0) */
+        if (!(pte_flags & PTE_NX) && !(pte_flags & PTE_RW)) {
+            send_response(sock, "WARNING: This page appears to be EXECUTE-ONLY (XOM)\n");
+        }
+    }
+    send_response(sock, "OK\n");
+}
+
+/*
+ * scan_pte - Scan page table entries for a range
+ * Usage: scan_pte <start_vaddr> <count> [stride]
+ */
+static void
+cmd_scan_pte(int sock, const char *args)
+{
+    unsigned long start_vaddr, count, stride = 0x1000;
+    uint64_t paddr, pte_flags;
+
+    int parsed = sscanf(args, "%lx %lx %lx", &start_vaddr, &count, &stride);
+    if (parsed < 2) {
+        send_response(sock, "ERROR: Usage: scan_pte <start_vaddr> <count> [stride]\n");
+        return;
+    }
+    if (stride == 0) stride = 0x1000;
+    if (count > 256) count = 256;
+
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
+    uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
+    uint64_t dmap_base = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_BASE);
+
+    send_response(sock, "=== PTE Scan: 0x%lx + %lu entries (stride 0x%lx) ===\n",
+                  start_vaddr, count, stride);
+    send_response(sock, "%-18s %-18s %-6s %-4s %-4s %-5s\n",
+                  "VADDR", "PADDR", "FLAGS", "RW", "NX", "XOM");
+    send_response(sock, "--------------------------------------------------------------\n");
+
+    for (unsigned long i = 0; i < count; i++) {
+        uint64_t va = start_vaddr + (i * stride);
+
+        if (vaddr_to_paddr_quiet(dmap_base, pm_cr3, va, &paddr, &pte_flags) == 0) {
+            int is_xom = (!(pte_flags & PTE_NX) && !(pte_flags & PTE_RW));
+            send_response(sock, "0x%016lx 0x%016lx 0x%04lx %-4s %-4s %-5s\n",
+                          va, paddr, pte_flags & 0xFFF,
+                          (pte_flags & PTE_RW) ? "RW" : "RO",
+                          (pte_flags & PTE_NX) ? "NX" : "X",
+                          is_xom ? "YES" : "");
+        } else {
+            send_response(sock, "0x%016lx UNMAPPED\n", va);
+        }
+    }
+    send_response(sock, "OK\n");
+}
+
+/*
+ * cmp_sections - Compare .text vs .data page table mappings
+ */
+static void
+cmd_cmp_sections(int sock)
+{
+    intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    uint64_t text_paddr = 0, text_flags = 0;
+    uint64_t data_paddr = 0, data_flags = 0;
+
+    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
+    uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
+    uint64_t dmap_base = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_BASE);
+
+    send_response(sock, "=== Kernel Section Comparison ===\n\n");
+
+    /* Analyze kernel .text */
+    send_response(sock, "--- Kernel .text (0x%lx) ---\n", ktext_base);
+    if (vaddr_to_paddr(sock, ktext_base, dmap_base, pm_cr3, &text_paddr, &text_flags) == 0) {
+        send_response(sock, "Physical: 0x%lx\n", text_paddr);
+        send_response(sock, "Flags: RW=%d NX=%d (XOM=%s)\n",
+                      !!(text_flags & PTE_RW),
+                      !!(text_flags & PTE_NX),
+                      (!(text_flags & PTE_NX) && !(text_flags & PTE_RW)) ? "YES" : "NO");
+    }
+
+    send_response(sock, "\n--- Kernel .data (0x%lx) ---\n", kdata_base);
+    if (vaddr_to_paddr(sock, kdata_base, dmap_base, pm_cr3, &data_paddr, &data_flags) == 0) {
+        send_response(sock, "Physical: 0x%lx\n", data_paddr);
+        send_response(sock, "Flags: RW=%d NX=%d\n",
+                      !!(data_flags & PTE_RW),
+                      !!(data_flags & PTE_NX));
+    }
+
+    /* Calculate offsets */
+    send_response(sock, "\n=== Analysis ===\n");
+    send_response(sock, "Text-Data VA offset: 0x%lx\n", kdata_base - ktext_base);
+    if (text_paddr && data_paddr) {
+        send_response(sock, "Text-Data PA offset: 0x%lx\n",
+                      (data_paddr > text_paddr) ? data_paddr - text_paddr : text_paddr - data_paddr);
+    }
+    send_response(sock, "OK\n");
+}
+
+/*
+ * probe_xom - Diagnose XOM enforcement level
+ */
+static void
+cmd_probe_xom(int sock)
+{
+    intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    uint64_t text_paddr = 0, text_flags = 0;
+
+    intptr_t pmap_store = kdata_base + PMAP_STORE_OFFSET;
+    uint64_t pm_cr3 = kernel_getlong(pmap_store + PMAP_OFFSET_PM_CR3);
+    uint64_t dmap_base = kernel_getlong(pmap_store + PMAP_OFFSET_DMAP_BASE);
+
+    send_response(sock, "=== XOM Probe Analysis ===\n\n");
+
+    /* Get physical address of kernel .text */
+    send_response(sock, "Step 1: Walking page tables for kernel .text...\n");
+    if (vaddr_to_paddr(sock, ktext_base, dmap_base, pm_cr3, &text_paddr, &text_flags) != 0) {
+        send_response(sock, "ERROR: Cannot translate kernel .text address\n");
+        return;
+    }
+
+    send_response(sock, "\nStep 2: Testing different access methods...\n\n");
+
+    uint8_t sample_direct[32], sample_dmap[32];
+    int direct_ok = 0, dmap_ok = 0;
+
+    /* Method 1: Direct read via kernel vaddr */
+    send_response(sock, "Method 1 - Direct kernel_copyout(0x%lx):\n", ktext_base);
+    memset(sample_direct, 0, sizeof(sample_direct));
+    if (kernel_copyout(ktext_base, sample_direct, 32) == 0) {
+        direct_ok = 1;
+        send_response(sock, "  SUCCESS: ");
+        for (int i = 0; i < 16; i++)
+            send_response(sock, "%02x ", sample_direct[i]);
+        send_response(sock, "\n");
+    } else {
+        send_response(sock, "  FAILED\n");
+    }
+
+    /* Method 2: Read via DMAP using translated physical address */
+    uint64_t dmap_vaddr = dmap_base + text_paddr;
+    send_response(sock, "\nMethod 2 - DMAP read(0x%lx) [PA 0x%lx]:\n", dmap_vaddr, text_paddr);
+    memset(sample_dmap, 0, sizeof(sample_dmap));
+    if (kernel_copyout(dmap_vaddr, sample_dmap, 32) == 0) {
+        dmap_ok = 1;
+        send_response(sock, "  SUCCESS: ");
+        for (int i = 0; i < 16; i++)
+            send_response(sock, "%02x ", sample_dmap[i]);
+        send_response(sock, "\n");
+    } else {
+        send_response(sock, "  FAILED\n");
+    }
+
+    /* Analysis */
+    send_response(sock, "\n=== Diagnosis ===\n");
+    if (!direct_ok && !dmap_ok) {
+        send_response(sock, "Both methods failed - likely HV-enforced XOM\n");
+        send_response(sock, "The hypervisor may be intercepting ALL reads to code pages\n");
+    } else if (direct_ok && dmap_ok) {
+        if (memcmp(sample_direct, sample_dmap, 32) == 0) {
+            send_response(sock, "Both methods return SAME data\n");
+        } else {
+            send_response(sock, "Methods return DIFFERENT data!\n");
+            send_response(sock, "DMAP may be returning shadow/fake data (HV interception)\n");
+        }
+    } else if (direct_ok && !dmap_ok) {
+        send_response(sock, "Direct works but DMAP fails - unusual configuration\n");
+    } else {
+        send_response(sock, "DMAP works but direct fails - possible kernel-level XOM\n");
+    }
+
+    /* Check for vtable signatures */
+    send_response(sock, "\n=== Content Analysis ===\n");
+    int has_kernel_ptrs = 0;
+    uint8_t *sample = dmap_ok ? sample_dmap : sample_direct;
+    for (int i = 0; i < 4; i++) {
+        uint64_t val;
+        memcpy(&val, sample + (i * 8), 8);
+        /* Check for kernel pointer ranges: 0xffffffff8xxxxxxx or 0xffffffffcxxxxxxx */
+        if ((val >> 32) == 0xffffffff && ((val >> 28) & 0xF) >= 0x8) {
+            has_kernel_ptrs++;
+        }
+    }
+
+    if (has_kernel_ptrs >= 2) {
+        send_response(sock, "Data contains multiple kernel pointers\n");
+        send_response(sock, "This looks like VTABLES, NOT executable code!\n");
+        send_response(sock, "Possible causes:\n");
+        send_response(sock, "  1. KERNEL_ADDRESS_TEXT_BASE is incorrect\n");
+        send_response(sock, "  2. HV is returning different data for code pages\n");
+    } else {
+        /* Check for x86-64 code patterns */
+        int has_prologue = 0;
+        for (int i = 0; i < 28; i++) {
+            if (sample[i] == 0x55 && sample[i+1] == 0x48 &&
+                sample[i+2] == 0x89 && sample[i+3] == 0xe5) {
+                has_prologue = 1;
+                break;
+            }
+        }
+        if (has_prologue) {
+            send_response(sock, "Found x86-64 function prologue (push rbp; mov rbp,rsp)\n");
+            send_response(sock, "This appears to be ACTUAL CODE!\n");
+        } else {
+            send_response(sock, "No obvious code patterns or vtables detected\n");
+            send_response(sock, "Data may be encrypted or this is a different region\n");
+        }
+    }
+
+    send_response(sock, "OK\n");
 }
 
 /* Display kernel information */
@@ -243,6 +679,14 @@ handle_command(int sock, char *cmd) {
         cmd_dump_vaddr(sock, cmd + 11);
     } else if (strncmp(cmd, "dump_paddr ", 11) == 0) {
         cmd_dump_paddr(sock, cmd + 11);
+    } else if (strncmp(cmd, "dump_pte ", 9) == 0) {
+        cmd_dump_pte(sock, cmd + 9);
+    } else if (strncmp(cmd, "scan_pte ", 9) == 0) {
+        cmd_scan_pte(sock, cmd + 9);
+    } else if (strcmp(cmd, "cmp_sections") == 0) {
+        cmd_cmp_sections(sock);
+    } else if (strcmp(cmd, "probe_xom") == 0) {
+        cmd_probe_xom(sock);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -252,6 +696,10 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "dump_base                - Dump 1MB from kernel .data\n");
         send_response(sock, "dump_vaddr <addr> <size> - Dump from virtual address\n");
         send_response(sock, "dump_paddr <addr> <size> - Dump from physical address via DMAP\n");
+        send_response(sock, "dump_pte <vaddr>         - Walk page tables for address\n");
+        send_response(sock, "scan_pte <va> <n> [s]    - Scan PTEs for address range\n");
+        send_response(sock, "cmp_sections             - Compare .text vs .data mappings\n");
+        send_response(sock, "probe_xom                - Analyze XOM protection mechanism\n");
         send_response(sock, "exit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
