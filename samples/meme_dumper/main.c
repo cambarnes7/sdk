@@ -2259,9 +2259,211 @@ cmd_find_cfi_targets(int sock)
 }
 
 /*
+ * IDT Discovery Helpers
+ *
+ * The PS5 hypervisor blocks SIDT (kernel panic) and the cached IDTR
+ * structure is not stored in .data. Instead we find the IDT by scanning
+ * .data/.bss for a contiguous block of valid x86-64 gate descriptors.
+ */
+
+/* Validate a single 16-byte gate descriptor entry */
+static int
+is_valid_idt_gate(const uint8_t *e, uint64_t ktext_base, uint64_t ktext_size)
+{
+    /* Selector must be kernel code segment (0x0020) */
+    uint16_t sel;
+    memcpy(&sel, e + 2, 2);
+    if (sel != 0x0020)
+        return 0;
+
+    /* Present bit must be set */
+    if (!((e[5] >> 7) & 1))
+        return 0;
+
+    /* Type must be interrupt gate (14) or trap gate (15) */
+    uint8_t type = e[5] & 0x0F;
+    if (type != 14 && type != 15)
+        return 0;
+
+    /* Reserved bytes 12-15 must be zero */
+    uint32_t reserved;
+    memcpy(&reserved, e + 12, 4);
+    if (reserved != 0)
+        return 0;
+
+    /* Reconstructed handler must point into kernel .text range */
+    uint16_t off_low, off_mid;
+    uint32_t off_high;
+    memcpy(&off_low, e + 0, 2);
+    memcpy(&off_mid, e + 6, 2);
+    memcpy(&off_high, e + 8, 4);
+    uint64_t handler = (uint64_t)off_low |
+                       ((uint64_t)off_mid << 16) |
+                       ((uint64_t)off_high << 32);
+
+    if (handler < ktext_base || handler >= ktext_base + ktext_size)
+        return 0;
+
+    return 1;
+}
+
+/*
+ * Scan kernel .data/.bss for the IDT by pattern-matching gate descriptors.
+ * Returns 0 on success (idt_base_out is set), -1 on failure.
+ *
+ * Phase 1: Page-aligned scan (fast - IDT is almost certainly page-aligned).
+ * Phase 2: 16-byte aligned scan (thorough fallback).
+ */
+#define IDT_SCAN_RANGE    0x2000000  /* 32MB: covers .data + .bss */
+#define IDT_KTEXT_RANGE   0x2000000  /* 32MB: handler address validation */
+#define IDT_QUICK_MIN     3          /* min valid of first 4 entries */
+#define IDT_CONFIRM_MIN   16         /* min valid of first 20 entries */
+
+static int
+find_idt_base(int sock, uint64_t *idt_base_out)
+{
+    uint64_t kdata_base = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+    uint64_t ktext_base = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
+    uint64_t scan_end = kdata_base + IDT_SCAN_RANGE;
+    uint8_t buf[4096];
+    int chunks_scanned = 0;
+
+    send_response(sock, "Scanning %luMB for IDT gate descriptors...\n",
+                  (unsigned long)(IDT_SCAN_RANGE / (1024 * 1024)));
+
+    /* Phase 1: Page-aligned scan (check offset 0 of each 4KB chunk) */
+    send_response(sock, "Phase 1: page-aligned scan...\n");
+
+    for (uint64_t addr = kdata_base; addr < scan_end; addr += 4096) {
+        if (kernel_copyout(addr, buf, 4096) != 0) {
+            chunks_scanned++;
+            continue;
+        }
+        chunks_scanned++;
+
+        if ((chunks_scanned & 0x7FF) == 0)
+            send_response(sock, "  ...%d chunks (%luMB)\n",
+                          chunks_scanned,
+                          (unsigned long)chunks_scanned * 4096 / (1024 * 1024));
+
+        /* Quick filter: check entries 0-3 at offset 0 */
+        int valid = 0;
+        for (int v = 0; v < 4; v++) {
+            if (is_valid_idt_gate(buf + v * 16, ktext_base, IDT_KTEXT_RANGE))
+                valid++;
+        }
+        if (valid < IDT_QUICK_MIN)
+            continue;
+
+        send_response(sock, "  candidate at 0x%lx (%d/4 quick match)\n",
+                      addr, valid);
+
+        /* Confirm: check entries 0-19 */
+        int confirmed = 0;
+        for (int v = 0; v < 20; v++) {
+            if (is_valid_idt_gate(buf + v * 16, ktext_base, IDT_KTEXT_RANGE))
+                confirmed++;
+        }
+        if (confirmed >= IDT_CONFIRM_MIN) {
+            send_response(sock, "  CONFIRMED: IDT at 0x%lx (%d/20 valid)\n",
+                          addr, confirmed);
+            *idt_base_out = addr;
+            return 0;
+        }
+        send_response(sock, "  rejected (%d/20, need %d)\n",
+                      confirmed, IDT_CONFIRM_MIN);
+    }
+
+    send_response(sock, "Phase 1: not found (%d chunks)\n", chunks_scanned);
+
+    /* Phase 2: 16-byte aligned scan (thorough) */
+    send_response(sock, "Phase 2: 16-byte aligned scan...\n");
+    chunks_scanned = 0;
+
+    for (uint64_t addr = kdata_base; addr < scan_end; addr += 4096) {
+        if (kernel_copyout(addr, buf, 4096) != 0) {
+            chunks_scanned++;
+            continue;
+        }
+        chunks_scanned++;
+
+        if ((chunks_scanned & 0x7FF) == 0)
+            send_response(sock, "  ...%d chunks (%luMB)\n",
+                          chunks_scanned,
+                          (unsigned long)chunks_scanned * 4096 / (1024 * 1024));
+
+        for (int off = 16; off < 4096; off += 16) {
+            /* Fast reject: check selector byte of first entry */
+            if (buf[off + 2] != 0x20 || buf[off + 3] != 0x00)
+                continue;
+
+            /* Check entries 0-3 */
+            int valid = 0;
+            if (off + 64 <= 4096) {
+                for (int v = 0; v < 4; v++) {
+                    if (is_valid_idt_gate(buf + off + v * 16,
+                                          ktext_base, IDT_KTEXT_RANGE))
+                        valid++;
+                }
+            } else {
+                /* Entries span chunk boundary - targeted read */
+                uint8_t span[64];
+                if (addr + off + 64 > scan_end)
+                    continue;
+                if (kernel_copyout(addr + off, span, 64) != 0)
+                    continue;
+                for (int v = 0; v < 4; v++) {
+                    if (is_valid_idt_gate(span + v * 16,
+                                          ktext_base, IDT_KTEXT_RANGE))
+                        valid++;
+                }
+            }
+            if (valid < IDT_QUICK_MIN)
+                continue;
+
+            /* Confirm: read entries 0-19 (320 bytes) */
+            uint64_t cand = addr + off;
+            uint8_t confirm_buf[320];
+            send_response(sock, "  candidate at 0x%lx (off=0x%x, %d/4)\n",
+                          cand, off, valid);
+
+            if (cand + 320 > scan_end)
+                continue;
+            if (kernel_copyout(cand, confirm_buf, 320) != 0)
+                continue;
+
+            int confirmed = 0;
+            for (int v = 0; v < 20; v++) {
+                if (is_valid_idt_gate(confirm_buf + v * 16,
+                                      ktext_base, IDT_KTEXT_RANGE))
+                    confirmed++;
+            }
+            if (confirmed >= IDT_CONFIRM_MIN) {
+                send_response(sock, "  CONFIRMED: IDT at 0x%lx (%d/20 valid)\n",
+                              cand, confirmed);
+                *idt_base_out = cand;
+                return 0;
+            }
+            send_response(sock, "  rejected (%d/20, need %d)\n",
+                          confirmed, IDT_CONFIRM_MIN);
+        }
+    }
+
+    send_response(sock, "Phase 2: not found (%d chunks)\n", chunks_scanned);
+    send_response(sock, "ERROR: Could not locate IDT in %luMB\n",
+                  (unsigned long)(IDT_SCAN_RANGE / (1024 * 1024)));
+    return -1;
+}
+
+#undef IDT_SCAN_RANGE
+#undef IDT_KTEXT_RANGE
+#undef IDT_QUICK_MIN
+#undef IDT_CONFIRM_MIN
+
+/*
  * dump_idt - Discover and parse the Interrupt Descriptor Table
  *
- * Finds the IDT via SIDT instruction (or .data scan if UMIP blocks it),
+ * Finds the IDT by scanning .data/.bss for valid gate descriptor patterns,
  * reads all 256 gate descriptors, and displays handler addresses, IST
  * assignments, and gate types. Key output for singlestep primitive:
  * #DB (vec 1) and #GP (vec 13) handler addresses and IST indices.
@@ -2279,73 +2481,9 @@ cmd_dump_idt(int sock)
 
     send_response(sock, "=== IDT Discovery ===\n\n");
 
-    /*
-     * SIDT is not used - the PS5 hypervisor intercepts it and panics
-     * the kernel before any signal handler can catch the fault.
-     * Instead we scan .data for the cached IDTR structure.
-     */
-    {
-        send_response(sock, "--- Scanning .data for cached IDTR ---\n");
-        uint8_t buf[4096];
-        uint64_t scan_end = (uint64_t)kdata_base + 0x1000000;
-        int chunks_scanned = 0;
-
-        for (uint64_t addr = (uint64_t)kdata_base;
-             addr < scan_end && !found_idt; addr += sizeof(buf)) {
-            if (kernel_copyout(addr, buf, sizeof(buf)) != 0)
-                continue;
-            chunks_scanned++;
-
-            for (int i = 0; i <= (int)sizeof(buf) - 10; i += 2) {
-                uint16_t limit;
-                uint64_t base;
-                memcpy(&limit, buf + i, 2);
-                memcpy(&base, buf + i + 2, 8);
-
-                if (limit != 0x0FFF)
-                    continue;
-                /* Check if base looks like a kernel VA */
-                if ((base >> 40) != 0xFFFFFF)
-                    continue;
-                /* IDT must be 16-byte aligned */
-                if (base & 0xF)
-                    continue;
-                /*
-                 * CRITICAL: Only validate addresses in .data range.
-                 * Reading .text or other HV-protected regions will panic.
-                 */
-                if (base < (uint64_t)kdata_base ||
-                    base >= (uint64_t)kdata_base + 0x4000000)
-                    continue;
-
-                send_response(sock, "  candidate at kdata+0x%lx: base=0x%lx, validating...\n",
-                              (addr + i) - (uint64_t)kdata_base, base);
-
-                /* Validate: read first IDT entry at this base */
-                uint8_t entry[16];
-                if (kernel_copyout(base, entry, 16) != 0)
-                    continue;
-                uint8_t p = (entry[5] >> 7) & 1;
-                uint8_t type = entry[5] & 0x0F;
-                uint16_t sel;
-                memcpy(&sel, entry + 2, 2);
-
-                if (p == 1 && (type == 14 || type == 15) && sel == 0x20) {
-                    idt_base = base;
-                    found_idt = 1;
-                    send_response(sock, "  Found IDTR at kdata+0x%lx: base=0x%lx\n",
-                                  (addr + i) - (uint64_t)kdata_base, base);
-                    break;
-                }
-            }
-        }
-        send_response(sock, "  scanned %d chunks\n", chunks_scanned);
-        if (!found_idt)
-            send_response(sock, "  IDTR not found in .data scan\n");
-    }
+    found_idt = (find_idt_base(sock, &idt_base) == 0);
 
     if (!found_idt) {
-        send_response(sock, "\nERROR: Could not locate IDT\n");
         send_response(sock, "OK\n");
         return;
     }
@@ -2544,59 +2682,15 @@ cmd_find_doreti_iret(int sock)
 
     send_response(sock, "=== Phase 7b: doreti_iret Finder ===\n\n");
 
-    /* ---- Step 1: IDT Discovery (scan .data for cached IDTR) ---- */
-    /*
-     * SIDT is not used - the PS5 hypervisor intercepts it and panics
-     * the kernel before any signal handler can catch the fault.
-     */
+    /* ---- Step 1: IDT Discovery (gate descriptor pattern scan) ---- */
     send_response(sock, "--- Step 1: IDT Discovery ---\n");
 
     uint64_t idt_base = 0;
     int found_idt = 0;
 
-    {
-        send_response(sock, "Scanning .data for IDTR...\n");
-        uint8_t scan_buf[4096];
-        uint64_t scan_end = (uint64_t)kdata_base + 0x1000000;
-
-        for (uint64_t addr = (uint64_t)kdata_base;
-             addr < scan_end && !found_idt; addr += sizeof(scan_buf)) {
-            if (kernel_copyout(addr, scan_buf, sizeof(scan_buf)) != 0)
-                continue;
-            for (int i = 0; i <= (int)sizeof(scan_buf) - 10; i += 2) {
-                uint16_t limit;
-                uint64_t base;
-                memcpy(&limit, scan_buf + i, 2);
-                memcpy(&base, scan_buf + i + 2, 8);
-
-                if (limit != 0x0FFF)
-                    continue;
-                if ((base >> 40) != 0xFFFFFF)
-                    continue;
-                if (base & 0xF)
-                    continue;
-                /* Only validate addresses in .data range - HV will panic on .text */
-                if (base < (uint64_t)kdata_base ||
-                    base >= (uint64_t)kdata_base + 0x4000000)
-                    continue;
-
-                /* Validate first IDT entry */
-                uint8_t entry[16];
-                if (kernel_copyout(base, entry, 16) != 0)
-                    continue;
-                uint8_t p = (entry[5] >> 7) & 1;
-                uint8_t type = entry[5] & 0x0F;
-                uint16_t sel;
-                memcpy(&sel, entry + 2, 2);
-
-                if (p == 1 && (type == 14 || type == 15) && sel == 0x20) {
-                    idt_base = base;
-                    found_idt = 1;
-                    send_response(sock, "IDT base: 0x%lx (from .data scan)\n", idt_base);
-                    break;
-                }
-            }
-        }
+    if (find_idt_base(sock, &idt_base) == 0) {
+        found_idt = 1;
+        send_response(sock, "IDT base: 0x%lx\n", idt_base);
     }
 
     if (!found_idt) {
