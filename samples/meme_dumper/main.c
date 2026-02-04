@@ -2331,7 +2331,7 @@ is_valid_idt_gate(const uint8_t *e, uint64_t ktext_base, uint64_t ktext_size)
  * Phase 1: Page-aligned scan (fast - IDT is almost certainly page-aligned).
  * Phase 2: 16-byte aligned scan (thorough fallback).
  */
-#define IDT_SCAN_RANGE    0x2000000  /* 32MB: covers .data + .bss */
+#define IDT_SCAN_RANGE    0x4000000  /* 64MB: matches TSS scan range */
 #define IDT_KTEXT_RANGE   0x2000000  /* 32MB: handler address validation */
 #define IDT_QUICK_MIN     3          /* min valid of first 4 entries */
 #define IDT_CONFIRM_MIN   16         /* min valid of first 20 entries */
@@ -4076,17 +4076,22 @@ broad_done:
          *
          * Note: SIDT is trapped by the PS5 hypervisor, so we cannot use it.
          */
-        send_response(sock, "\n7b. Finding IDT (r_idt scan)...\n");
-        {
+        send_response(sock, "\n7b. Finding IDT...\n");
+        if (idt_base != 0) {
+            send_response(sock, "  Using IDT from Step 1: 0x%lx\n", idt_base);
+        } else {
             uint64_t kdata = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
             uint64_t ktext = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
-            uint64_t scan_size = 0x2000000; /* 32MB */
+            uint64_t scan_size = 0x4000000; /* 64MB: matches TSS scan range */
             uint8_t page[4096];
             int idt_found = 0;
 
             for (uint64_t addr = kdata;
                  addr < kdata + scan_size && !idt_found;
                  addr += 4096) {
+                if (((addr - kdata) & 0x7FFFFF) == 0 && addr != kdata)
+                    send_response(sock, "  ...%luMB\n",
+                                  (unsigned long)((addr - kdata) >> 20));
                 if (kernel_copyout(addr, page, 4096) != 0)
                     continue;
 
@@ -4167,6 +4172,9 @@ broad_done:
                 for (uint64_t addr = kdata;
                      addr < kdata + scan_size && !idt_found;
                      addr += 4096) {
+                    if (((addr - kdata) & 0x7FFFFF) == 0 && addr != kdata)
+                        send_response(sock, "  ...%luMB\n",
+                                      (unsigned long)((addr - kdata) >> 20));
                     if (kernel_copyout(addr, page, 4096) != 0)
                         continue;
 
@@ -4211,8 +4219,10 @@ broad_done:
                 send_response(sock, "  IDT not found in kernel .data\n");
                 goto step7_cleanup;
             }
+        }
 
-            /* Read #GP gate (vector 13) */
+        /* Read #GP gate (vector 13) */
+        {
             uint8_t gp_gate[16];
             if (kernel_copyout(idt_base + 13 * 16, gp_gate, 16) != 0) {
                 send_response(sock, "  Cannot read #GP gate\n");
