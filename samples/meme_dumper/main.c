@@ -473,111 +473,72 @@ cmd_cmp_sections(int sock)
 }
 
 /*
- * probe_xom - Diagnose XOM enforcement level
+ * probe_xom - Diagnose XOM enforcement level (SAFE - no reads from .text)
+ *
+ * WARNING: Previous version caused kernel panic by attempting to read
+ * from kernel .text. The PS5 hypervisor enforces XOM and crashes on
+ * any attempt to read code pages.
+ *
+ * This version only analyzes page table flags without reading protected memory.
  */
 static void
 cmd_probe_xom(int sock)
 {
     intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
     uint64_t text_paddr = 0, text_flags = 0;
+    uint64_t data_paddr = 0, data_flags = 0;
 
     uint64_t pm_cr3 = get_kernel_cr3();
     uint64_t dmap_base = get_dmap_base();
 
-    send_response(sock, "=== XOM Probe Analysis ===\n\n");
+    send_response(sock, "=== XOM Probe Analysis (SAFE MODE) ===\n\n");
+    send_response(sock, "WARNING: Reading kernel .text causes kernel panic!\n");
+    send_response(sock, "This indicates HV-enforced XOM protection.\n\n");
 
-    /* Get physical address of kernel .text */
-    send_response(sock, "Step 1: Walking page tables for kernel .text...\n");
-    if (vaddr_to_paddr(sock, ktext_base, dmap_base, pm_cr3, &text_paddr, &text_flags) != 0) {
-        send_response(sock, "ERROR: Cannot translate kernel .text address\n");
-        return;
+    /* Analyze kernel .text page table entry */
+    send_response(sock, "=== Kernel .text (0x%lx) ===\n", ktext_base);
+    if (vaddr_to_paddr(sock, ktext_base, dmap_base, pm_cr3, &text_paddr, &text_flags) == 0) {
+        send_response(sock, "\nPhysical address: 0x%lx\n", text_paddr);
+        send_response(sock, "Page flags: 0x%lx\n", text_flags & 0x8000000000000FFFUL);
+        send_response(sock, "  Present:  %d\n", !!(text_flags & PTE_P));
+        send_response(sock, "  RW:       %d (0=Read-Only)\n", !!(text_flags & PTE_RW));
+        send_response(sock, "  User:     %d\n", !!(text_flags & PTE_US));
+        send_response(sock, "  Accessed: %d\n", !!(text_flags & PTE_A));
+        send_response(sock, "  NX:       %d (0=Executable)\n", !!(text_flags & PTE_NX));
+
+        int is_xom = (!(text_flags & PTE_NX) && !(text_flags & PTE_RW));
+        send_response(sock, "  XOM:      %s\n", is_xom ? "YES (Execute-Only)" : "NO");
     }
 
-    send_response(sock, "\nStep 2: Testing different access methods...\n\n");
-
-    uint8_t sample_direct[32], sample_dmap[32];
-    int direct_ok = 0, dmap_ok = 0;
-
-    /* Method 1: Direct read via kernel vaddr */
-    send_response(sock, "Method 1 - Direct kernel_copyout(0x%lx):\n", ktext_base);
-    memset(sample_direct, 0, sizeof(sample_direct));
-    if (kernel_copyout(ktext_base, sample_direct, 32) == 0) {
-        direct_ok = 1;
-        send_response(sock, "  SUCCESS: ");
-        for (int i = 0; i < 16; i++)
-            send_response(sock, "%02x ", sample_direct[i]);
-        send_response(sock, "\n");
-    } else {
-        send_response(sock, "  FAILED\n");
+    /* Analyze kernel .data page table entry for comparison */
+    send_response(sock, "\n=== Kernel .data (0x%lx) ===\n", kdata_base);
+    if (vaddr_to_paddr(sock, kdata_base, dmap_base, pm_cr3, &data_paddr, &data_flags) == 0) {
+        send_response(sock, "\nPhysical address: 0x%lx\n", data_paddr);
+        send_response(sock, "Page flags: 0x%lx\n", data_flags & 0x8000000000000FFFUL);
+        send_response(sock, "  Present:  %d\n", !!(data_flags & PTE_P));
+        send_response(sock, "  RW:       %d\n", !!(data_flags & PTE_RW));
+        send_response(sock, "  User:     %d\n", !!(data_flags & PTE_US));
+        send_response(sock, "  Accessed: %d\n", !!(data_flags & PTE_A));
+        send_response(sock, "  NX:       %d\n", !!(data_flags & PTE_NX));
     }
 
-    /* Method 2: Read via DMAP using translated physical address */
-    uint64_t dmap_vaddr = dmap_base + text_paddr;
-    send_response(sock, "\nMethod 2 - DMAP read(0x%lx) [PA 0x%lx]:\n", dmap_vaddr, text_paddr);
-    memset(sample_dmap, 0, sizeof(sample_dmap));
-    if (kernel_copyout(dmap_vaddr, sample_dmap, 32) == 0) {
-        dmap_ok = 1;
-        send_response(sock, "  SUCCESS: ");
-        for (int i = 0; i < 16; i++)
-            send_response(sock, "%02x ", sample_dmap[i]);
-        send_response(sock, "\n");
-    } else {
-        send_response(sock, "  FAILED\n");
-    }
-
-    /* Analysis */
+    /* Diagnosis */
     send_response(sock, "\n=== Diagnosis ===\n");
-    if (!direct_ok && !dmap_ok) {
-        send_response(sock, "Both methods failed - likely HV-enforced XOM\n");
-        send_response(sock, "The hypervisor may be intercepting ALL reads to code pages\n");
-    } else if (direct_ok && dmap_ok) {
-        if (memcmp(sample_direct, sample_dmap, 32) == 0) {
-            send_response(sock, "Both methods return SAME data\n");
+    if (text_paddr != 0) {
+        int text_xom = (!(text_flags & PTE_NX) && !(text_flags & PTE_RW));
+        if (text_xom) {
+            send_response(sock, "Kernel .text has XOM page flags (NX=0, RW=0)\n");
+            send_response(sock, "Combined with kernel panic on read attempt:\n");
+            send_response(sock, "  -> XOM is HYPERVISOR-ENFORCED\n");
+            send_response(sock, "  -> HV traps reads to code pages and crashes\n");
+            send_response(sock, "  -> DMAP bypass does NOT work\n");
+            send_response(sock, "\nTo dump kernel code, you would need:\n");
+            send_response(sock, "  1. Hypervisor exploit (e.g., APIC timing attack)\n");
+            send_response(sock, "  2. Or find unprotected code copy in memory\n");
         } else {
-            send_response(sock, "Methods return DIFFERENT data!\n");
-            send_response(sock, "DMAP may be returning shadow/fake data (HV interception)\n");
-        }
-    } else if (direct_ok && !dmap_ok) {
-        send_response(sock, "Direct works but DMAP fails - unusual configuration\n");
-    } else {
-        send_response(sock, "DMAP works but direct fails - possible kernel-level XOM\n");
-    }
-
-    /* Check for vtable signatures */
-    send_response(sock, "\n=== Content Analysis ===\n");
-    int has_kernel_ptrs = 0;
-    uint8_t *sample = dmap_ok ? sample_dmap : sample_direct;
-    for (int i = 0; i < 4; i++) {
-        uint64_t val;
-        memcpy(&val, sample + (i * 8), 8);
-        /* Check for kernel pointer ranges: 0xffffffff8xxxxxxx or 0xffffffffcxxxxxxx */
-        if ((val >> 32) == 0xffffffff && ((val >> 28) & 0xF) >= 0x8) {
-            has_kernel_ptrs++;
-        }
-    }
-
-    if (has_kernel_ptrs >= 2) {
-        send_response(sock, "Data contains multiple kernel pointers\n");
-        send_response(sock, "This looks like VTABLES, NOT executable code!\n");
-        send_response(sock, "Possible causes:\n");
-        send_response(sock, "  1. KERNEL_ADDRESS_TEXT_BASE is incorrect\n");
-        send_response(sock, "  2. HV is returning different data for code pages\n");
-    } else {
-        /* Check for x86-64 code patterns */
-        int has_prologue = 0;
-        for (int i = 0; i < 28; i++) {
-            if (sample[i] == 0x55 && sample[i+1] == 0x48 &&
-                sample[i+2] == 0x89 && sample[i+3] == 0xe5) {
-                has_prologue = 1;
-                break;
-            }
-        }
-        if (has_prologue) {
-            send_response(sock, "Found x86-64 function prologue (push rbp; mov rbp,rsp)\n");
-            send_response(sock, "This appears to be ACTUAL CODE!\n");
-        } else {
-            send_response(sock, "No obvious code patterns or vtables detected\n");
-            send_response(sock, "Data may be encrypted or this is a different region\n");
+            send_response(sock, "Kernel .text does NOT have XOM page flags\n");
+            send_response(sock, "But read attempt still caused panic - HV protection\n");
         }
     }
 
