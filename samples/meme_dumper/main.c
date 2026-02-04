@@ -4088,6 +4088,7 @@ broad_done:
             int idt_found = 0;
             int ridt_candidates_total = 0;
             int ridt_candidates_rejected = 0;
+            int ridt_probed = 0;
 
             for (uint64_t addr = kdata;
                  addr < kdata + scan_size && !idt_found;
@@ -4110,32 +4111,26 @@ broad_done:
                         continue;
 
                     ridt_candidates_total++;
-                    /* Safety: only probe addresses we know are readable.
-                     * .data range is safe; DMAP (direct map of physical
-                     * memory) is also safe. Reading from .text (XOM) or
-                     * unmapped addresses can panic. */
-                    int base_safe = 0;
-                    if (base >= kdata && base + 4096 <= kdata + scan_size)
-                        base_safe = 1; /* in .data range */
-                    else if (base >= dmap_base &&
-                             base < dmap_base + 0x100000000ULL)
-                        base_safe = 1; /* in DMAP (first 4GB) */
-                    if (!base_safe) {
+                    /* IDT must be at least 16-byte aligned; prefer
+                     * page-aligned first pass, fall back later. */
+                    if (base & 0xF)
+                        continue;
+                    /* Exclude .text range — XOM on PS5, reading
+                     * causes kernel panic via hypervisor. */
+                    if (base >= ktext && base < kdata) {
                         ridt_candidates_rejected++;
-                        if (ridt_candidates_rejected <= 5)
-                            send_response(sock,
-                                "  r_idt reject #%d: base=0x%lx "
-                                "align=%s\n",
-                                ridt_candidates_rejected, base,
-                                (base & 0xFFF) ? "no" : "PAGE");
                         continue;
                     }
 
-                    /* Candidate r_idt: validate by reading IDT gates */
+                    /* Candidate r_idt: validate by reading IDT gates.
+                     * kernel_copyout returns non-zero for unmapped
+                     * addresses without panicking. */
                     uint8_t gates[64]; /* first 4 entries */
-                    if (kernel_copyout(base, gates, 64) != 0)
+                    if (kernel_copyout(base, gates, 64) != 0) {
+                        ridt_candidates_rejected++;
                         continue;
-
+                    }
+                    ridt_probed++;
                     int valid = 0;
                     for (int v = 0; v < 4; v++) {
                         uint8_t *g = gates + v * 16;
@@ -4173,14 +4168,19 @@ broad_done:
                             "base=0x%lx (CS=0x%04x)\n",
                             (unsigned long)(addr + off - kdata),
                             limit, base, sel);
+                    } else if (ridt_probed <= 10) {
+                        send_response(sock,
+                            "  r_idt probe: base=0x%lx "
+                            "valid=%d/4 g[5]=%02x%02x%02x%02x\n",
+                            base, valid,
+                            gates[5], gates[21], gates[37], gates[53]);
                     }
                 }
             }
 
-            /* Fallback: direct IDT gate pattern scan (no selector check).
-             * This catches the case where the IDT is in .data but r_idt
-             * is not (e.g., HV-loaded IDT, or r_idt outside scan range).
-             * Uses the same relaxed validation as above. */
+            /* Fallback: direct IDT gate pattern scan.
+             * Checks every 16-byte-aligned offset in each page,
+             * not just offset 0 — IDT may not be page-aligned. */
             if (!idt_found) {
                 send_response(sock, "  r_idt not found; scanning for "
                               "IDT gate patterns...\n");
@@ -4193,39 +4193,44 @@ broad_done:
                     if (kernel_copyout(addr, page, 4096) != 0)
                         continue;
 
-                    /* Check offset 0: first 4 entries at page start */
-                    int valid = 0;
-                    for (int v = 0; v < 4; v++) {
-                        uint8_t *g = page + v * 16;
-                        if (!(g[5] & 0x80))
-                            continue;
-                        uint8_t type = g[5] & 0x0F;
-                        if (type != 14 && type != 15)
-                            continue;
-                        uint32_t rsvd;
-                        memcpy(&rsvd, g + 12, 4);
-                        if (rsvd != 0)
-                            continue;
-                        uint64_t h = (uint64_t)g[0] |
-                                     ((uint64_t)g[1] << 8) |
-                                     ((uint64_t)g[6] << 16) |
-                                     ((uint64_t)g[7] << 24) |
-                                     ((uint64_t)g[8] << 32) |
-                                     ((uint64_t)g[9] << 40) |
-                                     ((uint64_t)g[10] << 48) |
-                                     ((uint64_t)g[11] << 56);
-                        if (h >= 0xFFFF800000000000ULL)
-                            valid++;
-                    }
-                    if (valid >= 3) {
-                        idt_base = addr;
-                        idt_found = 1;
-                        uint16_t sel;
-                        memcpy(&sel, page + 2, 2);
-                        send_response(sock,
-                            "  IDT gates at kdata+0x%lx (%d/4 valid, "
-                            "CS=0x%04x)\n",
-                            (unsigned long)(addr - kdata), valid, sel);
+                    /* Check every 16-byte-aligned offset (need 64B) */
+                    for (int poff = 0;
+                         poff + 64 <= 4096 && !idt_found;
+                         poff += 16) {
+                        int valid = 0;
+                        for (int v = 0; v < 4; v++) {
+                            uint8_t *g = page + poff + v * 16;
+                            if (!(g[5] & 0x80))
+                                continue;
+                            uint8_t type = g[5] & 0x0F;
+                            if (type != 14 && type != 15)
+                                continue;
+                            uint32_t rsvd;
+                            memcpy(&rsvd, g + 12, 4);
+                            if (rsvd != 0)
+                                continue;
+                            uint64_t h = (uint64_t)g[0] |
+                                         ((uint64_t)g[1] << 8) |
+                                         ((uint64_t)g[6] << 16) |
+                                         ((uint64_t)g[7] << 24) |
+                                         ((uint64_t)g[8] << 32) |
+                                         ((uint64_t)g[9] << 40) |
+                                         ((uint64_t)g[10] << 48) |
+                                         ((uint64_t)g[11] << 56);
+                            if (h >= 0xFFFF800000000000ULL)
+                                valid++;
+                        }
+                        if (valid >= 3) {
+                            idt_base = addr + poff;
+                            idt_found = 1;
+                            uint16_t sel;
+                            memcpy(&sel, page + poff + 2, 2);
+                            send_response(sock,
+                                "  IDT gates at kdata+0x%lx (%d/4 "
+                                "valid, CS=0x%04x)\n",
+                                (unsigned long)(addr + poff - kdata),
+                                valid, sel);
+                        }
                     }
                 }
             }
@@ -4235,9 +4240,10 @@ broad_done:
                 send_response(sock, "  Diag: kdata=0x%lx ktext=0x%lx "
                               "dmap=0x%lx\n", kdata, ktext, dmap_base);
                 send_response(sock, "  Diag: r_idt candidates=%d "
-                              "rejected=%d\n",
+                              "rejected=%d probed=%d\n",
                               ridt_candidates_total,
-                              ridt_candidates_rejected);
+                              ridt_candidates_rejected,
+                              ridt_probed);
                 goto step7_cleanup;
             }
         }
