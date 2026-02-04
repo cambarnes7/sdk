@@ -4706,36 +4706,8 @@ broad_done:
 
             getcontext((ucontext_t *)uc_buf);
 
-            /* Get approximate code address for annotation */
-            uint64_t approx_rip = (uint64_t)gp_trap_fault_handler;
-
             send_response(sock,
-                "  probe: known_rsp=0x%lx approx_code=0x%lx\n",
-                known_rsp, approx_rip);
-            send_response(sock,
-                "  SDK layout: mc_rip@%zu mc_rsp@%zu sizeof=%zu\n",
-                __builtin_offsetof(ucontext_t, uc_mcontext.mc_rip),
-                __builtin_offsetof(ucontext_t, uc_mcontext.mc_rsp),
-                sizeof(ucontext_t));
-
-            /* Dump non-sentinel qwords for analysis */
-            send_response(sock, "  raw ucontext (non-0xAA qwords):\n");
-            for (int i = 0; i < 800 && i < (int)sizeof(uc_buf); i += 8) {
-                uint64_t val = *(uint64_t *)(uc_buf + i);
-                if (val == 0xAAAAAAAAAAAAAAAAULL)
-                    continue;
-                send_response(sock, "    [%3d] 0x%016lx", i, val);
-                if (val >= known_rsp - 0x400 &&
-                    val <= known_rsp + 0x400)
-                    send_response(sock, "  <-- RSP?");
-                if (val >= approx_rip - 0x400000 &&
-                    val <= approx_rip + 0x400000 &&
-                    val > 0x10000)
-                    send_response(sock, "  <-- code?");
-                if (val == 0x43)
-                    send_response(sock, "  <-- CS=0x43?");
-                send_response(sock, "\n");
-            }
+                "  probe: known_rsp=0x%lx\n", known_rsp);
 
             /*
              * Search for mc_rsp: an 8-byte value matching known_rsp
@@ -4802,22 +4774,11 @@ broad_done:
             }
         }
 
-        /* Phase 2: Self-test signal delivery */
-        send_response(sock, "\n  Signal self-test...\n");
-        {
-            gp_trap_got_result = 0;
-            gp_trap_sig_received = 0;
-            if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
-                send_response(sock,
-                    "  signal %d caught, handler OK\n",
-                    (int)gp_trap_sig_received);
-            } else {
-                volatile int *bad = (volatile int *)0;
-                int x = *bad;
-                (void)x;
-                send_response(sock, "  FAIL: no fault on null read\n");
-            }
-        }
+        /* Phase 2: (signal self-test removed — the NULL deref was
+         * causing kernel panics on PS5, possibly a kernel bug with
+         * SA_ONSTACK signal delivery) */
+
+        send_response(sock, "\n  Probe complete. Proceeding to Phase 3...\n");
 
         /* Phase 3: Trigger loop
          *
