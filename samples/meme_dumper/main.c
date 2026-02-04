@@ -4284,20 +4284,22 @@ broad_done:
                               ridt_candidates_rejected,
                               ridt_probed);
 
-                /* Brute-force: scan physical memory 0..512MB via DMAP
+                /* Brute-force: scan physical memory 0..4GB via DMAP
                  * looking for IDT gate patterns at any 16-byte offset.
                  * The IDT must exist in physical RAM; even if the HV
                  * hides it from the kernel's VA space, DMAP may still
-                 * map those physical pages. */
-                uint64_t phys_scan_end = 0x20000000ULL; /* 512MB */
+                 * map those physical pages.  The IDT PA varies per boot
+                 * due to KASLR (observed at ~448MB on one run). */
+                uint64_t phys_scan_end = 0x100000000ULL; /* 4GB */
                 int phys_pages_read = 0;
                 int phys_pages_fail = 0;
                 for (uint64_t pa = 0;
                      pa < phys_scan_end && !idt_found;
                      pa += 4096) {
-                    if ((pa & 0x1FFFFFF) == 0)
-                        send_response(sock, "  ...PA %luMB\n",
-                            (unsigned long)(pa >> 20));
+                    if ((pa & 0x3FFFFFF) == 0)
+                        send_response(sock, "  ...PA %luMB/%luMB\n",
+                            (unsigned long)(pa >> 20),
+                            (unsigned long)(phys_scan_end >> 20));
                     if (kernel_copyout(dmap_base + pa,
                                        page, 4096) != 0) {
                         phys_pages_fail++;
