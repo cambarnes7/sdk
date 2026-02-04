@@ -4434,7 +4434,7 @@ broad_done:
                             valid++;
                     }
 
-                    if (valid >= 3 && ridt_cs_ok) {
+                    if (valid >= 3) {
                         idt_base = base;
                         idt_found = 1;
                         /* Set access address: use DMAP for XOM range */
@@ -4513,7 +4513,7 @@ broad_done:
                             if (h >= 0xFFFF800000000000ULL)
                                 valid++;
                         }
-                        if (valid >= 3 && any_cs_ok) {
+                        if (valid >= 3) {
                             idt_base = addr + poff;
                             idt_access = idt_base; /* in .data — direct */
                             idt_found = 1;
@@ -4603,10 +4603,10 @@ broad_done:
                         if (h >= 0xFFFF800000000000ULL)
                             valid++;
                     }
-                    /* Require at least one gate with non-zero CS to
-                     * reject false positives (e.g., random data that
-                     * happens to have valid-looking gate structures). */
-                    if (valid >= 3 && any_cs_nonzero) {
+                    /* PS5 HV manages IDT gates with CS=0x0000 — do NOT
+                     * require non-zero CS, as the real IDT may have all
+                     * gates with CS=0.  Handler+present checks suffice. */
+                    if (valid >= 3) {
                         idt_found = 1;
                         idt_base = dmap_base + pa + 0xc70;
                         idt_access = idt_base;
@@ -4675,7 +4675,7 @@ broad_done:
                                 if (h >= 0xFFFF800000000000ULL)
                                     valid++;
                             }
-                            if (valid >= 3 && any_cs_nz) {
+                            if (valid >= 3) {
                                 idt_found = 1;
                                 idt_base = dmap_base + pa + poff;
                                 idt_access = idt_base;
@@ -4729,13 +4729,13 @@ broad_done:
                           "type=0x%02x CS=0x%04x\n",
                           gp_handler_va, gp_ist_index, gp_gate[5], gp_cs);
 
-            /* Validate #GP gate: CS must be non-zero kernel selector,
-             * handler must be a kernel address, and gate must be present.
-             * CS=0 means null selector → this IDT is likely a false match. */
+            /* Validate #GP gate: handler must be a kernel address
+             * and gate must be present.
+             * Note: PS5 HV manages IDT with CS=0x0000 — this is normal
+             * and does NOT indicate a false match. */
             if (gp_cs == 0) {
-                send_response(sock, "  ERROR: #GP gate CS=0 (null selector) "
-                              "— IDT is likely a false match\n");
-                goto step7_cleanup;
+                send_response(sock, "  NOTE: #GP gate CS=0x0000 "
+                              "(HV-managed IDT — normal on PS5)\n");
             }
             if (!(gp_gate[5] & 0x80)) {
                 send_response(sock, "  ERROR: #GP gate not present\n");
@@ -5005,7 +5005,61 @@ broad_done:
                     }
                 }
 
-                /* Try to verify each via DMAP read */
+                /* V/V+2 pair check FIRST — zero kernel ops, zero risk.
+                 * doreti_iret is iretq (2 bytes: 0x48 0xcf), so
+                 * doreti_iret_fault = doreti_iret + 2.  FreeBSD's
+                 * trap.c references both.  Finding both V and V+2 in
+                 * .data is very strong evidence — no .text read needed. */
+                {
+                    uint64_t pair_va = 0;
+                    int pair_i = -1;
+                    for (int i = 0; i < num_near_ptrs && !pair_va; i++) {
+                        uint64_t v = near_ptrs[i].text_va;
+                        for (int j = 0; j < num_near_ptrs; j++) {
+                            if (near_ptrs[j].text_va == v + 2) {
+                                pair_va = v;
+                                pair_i = i;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (pair_va != 0) {
+                        uint64_t koff = pair_va - (uint64_t)ktext_base;
+                        send_response(sock,
+                            "\n  *** V/V+2 PAIR FOUND ***\n"
+                            "  doreti_iret      = 0x%lx (ktext+0x%lx)\n"
+                            "  doreti_iret_fault = 0x%lx (ktext+0x%lx)\n",
+                            pair_va, koff,
+                            pair_va + 2, koff + 2);
+                        send_response(sock,
+                            "  Found at kdata+0x%lx (dist=%+ld)\n",
+                            near_ptrs[pair_i].data_addr -
+                                (uint64_t)KERNEL_ADDRESS_DATA_BASE,
+                            (long)near_ptrs[pair_i].dist);
+                        send_response(sock,
+                            "Confidence: HIGH (V/V+2 pair in .data, "
+                            "zero kernel writes)\n");
+
+                        if (num_candidates < MAX_DORETI_CANDIDATES) {
+                            candidates[num_candidates].paddr =
+                                have_text_pa ? text_pa + koff : 0;
+                            candidates[num_candidates].ktext_offset = koff;
+                            candidates[num_candidates].has_swapgs_before = 1;
+                            candidates[num_candidates].near_handler = 13;
+                            candidates[num_candidates].page_dist = 0;
+                            num_candidates++;
+                        }
+                        goto classify;
+                    }
+
+                    send_response(sock,
+                        "  No V/V+2 pair found among %d pointers\n",
+                        num_near_ptrs);
+                }
+
+                /* Try to verify each via DMAP read (risky — XOM DMAP
+                 * reads may cause harder faults on some pages) */
                 uint64_t best_doreti = 0;
                 int best_score = 0;
 
@@ -5082,59 +5136,6 @@ broad_done:
                         num_candidates++;
                     }
                     goto classify;
-                }
-
-                /* Check for V, V+2 pairs even without DMAP verification.
-                 * doreti_iret is iretq (2 bytes: 0x48 0xcf), so
-                 * doreti_iret_fault = doreti_iret + 2.  FreeBSD's
-                 * trap.c references both.  Finding both V and V+2 in
-                 * .data is very strong evidence — no .text read needed. */
-                {
-                    uint64_t pair_va = 0;
-                    int pair_i = -1;
-                    for (int i = 0; i < num_near_ptrs && !pair_va; i++) {
-                        uint64_t v = near_ptrs[i].text_va;
-                        for (int j = 0; j < num_near_ptrs; j++) {
-                            if (near_ptrs[j].text_va == v + 2) {
-                                pair_va = v;
-                                pair_i = i;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (pair_va != 0) {
-                        uint64_t koff = pair_va - (uint64_t)ktext_base;
-                        send_response(sock,
-                            "\n  *** V/V+2 PAIR FOUND ***\n"
-                            "  doreti_iret      = 0x%lx (ktext+0x%lx)\n"
-                            "  doreti_iret_fault = 0x%lx (ktext+0x%lx)\n",
-                            pair_va, koff,
-                            pair_va + 2, koff + 2);
-                        send_response(sock,
-                            "  Found at kdata+0x%lx (dist=%+ld)\n",
-                            near_ptrs[pair_i].data_addr -
-                                (uint64_t)KERNEL_ADDRESS_DATA_BASE,
-                            (long)near_ptrs[pair_i].dist);
-                        send_response(sock,
-                            "Confidence: HIGH (V/V+2 pair in .data, "
-                            "zero kernel writes)\n");
-
-                        if (num_candidates < MAX_DORETI_CANDIDATES) {
-                            candidates[num_candidates].paddr =
-                                have_text_pa ? text_pa + koff : 0;
-                            candidates[num_candidates].ktext_offset = koff;
-                            candidates[num_candidates].has_swapgs_before = 1;
-                            candidates[num_candidates].near_handler = 13;
-                            candidates[num_candidates].page_dist = 0;
-                            num_candidates++;
-                        }
-                        goto classify;
-                    }
-
-                    send_response(sock,
-                        "  No V/V+2 pair found among %d pointers\n",
-                        num_near_ptrs);
                 }
 
                 /* Even if DMAP verify failed, report unverified pointers */
