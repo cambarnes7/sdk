@@ -1816,11 +1816,25 @@ cmd_identify_table(int sock, const char *args)
     unsigned long va;
     int context = 128;
 
-    if (!args || sscanf(args, "%lx %d", &va, &context) < 1) {
-        send_response(sock, "Usage: identify_table <va> [context_bytes]\n");
-        send_response(sock, "  va  - virtual address of table (from scan_apic_ops)\n");
-        send_response(sock, "  ctx - bytes before/after to show (default 128, max 512)\n");
+    if (!args || !*args) {
+        send_response(sock, "Usage: identify_table <addr> [context_bytes]\n");
+        send_response(sock, "  addr - kdata offset (e.g. 179180) or full VA\n");
+        send_response(sock, "  ctx  - bytes before/after to show (default 128, max 512)\n");
+        send_response(sock, "\nUse kdata offsets from scan_apic_ops output.\n");
         return;
+    }
+
+    /* Parse address: if < 0x10000000, treat as kdata offset */
+    unsigned long addr;
+    if (sscanf(args, "%lx %d", &addr, &context) < 1) {
+        send_response(sock, "ERROR: cannot parse address\n");
+        return;
+    }
+    if (addr < 0x10000000) {
+        va = (unsigned long)KERNEL_ADDRESS_DATA_BASE + addr;
+        send_response(sock, "(kdata+0x%lx -> VA 0x%lx)\n", addr, va);
+    } else {
+        va = addr;
     }
     if (context < 32) context = 32;
     if (context > 512) context = 512;
@@ -2128,7 +2142,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "timing_boundary          - Time reads at XOM boundary\n");
         send_response(sock, "verify_xom               - Verify XOM boundaries + APIC state\n");
         send_response(sock, "scan_apic_ops [min]      - Find function pointer tables\n");
-        send_response(sock, "identify_table <va> [ctx] - Identify function ptr table\n");
+        send_response(sock, "identify_table <off> [ctx] - Identify func ptr table (kdata offset)\n");
         send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
