@@ -2279,41 +2279,13 @@ cmd_dump_idt(int sock)
 
     send_response(sock, "=== IDT Discovery ===\n\n");
 
-    /* Method 1: SIDT instruction (may fault if UMIP enabled) */
-    send_response(sock, "--- Method 1: SIDT instruction ---\n");
+    /*
+     * SIDT is not used - the PS5 hypervisor intercepts it and panics
+     * the kernel before any signal handler can catch the fault.
+     * Instead we scan .data for the cached IDTR structure.
+     */
     {
-        struct sigaction sa, old_segv, old_bus, old_ill;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = probe_signal_handler;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;
-        sigaction(SIGSEGV, &sa, &old_segv);
-        sigaction(SIGBUS, &sa, &old_bus);
-        sigaction(SIGILL, &sa, &old_ill);
-
-        probe_fault_occurred = 0;
-        if (sigsetjmp(probe_jmp_env, 1) == 0) {
-            struct {
-                uint16_t limit;
-                uint64_t base;
-            } __attribute__((packed)) idtr;
-            __asm__ __volatile__("sidt %0" : "=m"(idtr));
-            idt_base = idtr.base;
-            found_idt = 1;
-            send_response(sock, "  base=0x%lx  limit=0x%x (%d entries)\n",
-                          idtr.base, idtr.limit, (idtr.limit + 1) / 16);
-        } else {
-            send_response(sock, "  SIDT faulted (UMIP likely enabled)\n");
-        }
-
-        sigaction(SIGSEGV, &old_segv, NULL);
-        sigaction(SIGBUS, &old_bus, NULL);
-        sigaction(SIGILL, &old_ill, NULL);
-    }
-
-    /* Method 2: Scan .data for cached IDTR (limit=0x0FFF + kernel VA) */
-    if (!found_idt) {
-        send_response(sock, "\n--- Method 2: Scan .data for IDTR ---\n");
+        send_response(sock, "--- Scanning .data for cached IDTR ---\n");
         uint8_t buf[4096];
         uint64_t scan_end = (uint64_t)kdata_base + 0x1000000;
 
@@ -2555,44 +2527,17 @@ cmd_find_doreti_iret(int sock)
 
     send_response(sock, "=== Phase 7b: doreti_iret Finder ===\n\n");
 
-    /* ---- Step 1: IDT Discovery (reuse SIDT approach from dump_idt) ---- */
+    /* ---- Step 1: IDT Discovery (scan .data for cached IDTR) ---- */
+    /*
+     * SIDT is not used - the PS5 hypervisor intercepts it and panics
+     * the kernel before any signal handler can catch the fault.
+     */
     send_response(sock, "--- Step 1: IDT Discovery ---\n");
 
     uint64_t idt_base = 0;
     int found_idt = 0;
 
-    /* Method 1: SIDT instruction */
     {
-        struct sigaction sa, old_segv, old_bus, old_ill;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = probe_signal_handler;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;
-        sigaction(SIGSEGV, &sa, &old_segv);
-        sigaction(SIGBUS, &sa, &old_bus);
-        sigaction(SIGILL, &sa, &old_ill);
-
-        probe_fault_occurred = 0;
-        if (sigsetjmp(probe_jmp_env, 1) == 0) {
-            struct {
-                uint16_t limit;
-                uint64_t base;
-            } __attribute__((packed)) idtr;
-            __asm__ __volatile__("sidt %0" : "=m"(idtr));
-            idt_base = idtr.base;
-            found_idt = 1;
-            send_response(sock, "IDT base: 0x%lx (via SIDT)\n", idt_base);
-        } else {
-            send_response(sock, "SIDT faulted (UMIP enabled)\n");
-        }
-
-        sigaction(SIGSEGV, &old_segv, NULL);
-        sigaction(SIGBUS, &old_bus, NULL);
-        sigaction(SIGILL, &old_ill, NULL);
-    }
-
-    /* Method 2: Scan .data for cached IDTR */
-    if (!found_idt) {
         send_response(sock, "Scanning .data for IDTR...\n");
         uint8_t scan_buf[4096];
         uint64_t scan_end = (uint64_t)kdata_base + 0x1000000;
