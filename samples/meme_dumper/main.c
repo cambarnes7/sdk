@@ -2288,11 +2288,14 @@ cmd_dump_idt(int sock)
         send_response(sock, "--- Scanning .data for cached IDTR ---\n");
         uint8_t buf[4096];
         uint64_t scan_end = (uint64_t)kdata_base + 0x1000000;
+        int chunks_scanned = 0;
 
         for (uint64_t addr = (uint64_t)kdata_base;
              addr < scan_end && !found_idt; addr += sizeof(buf)) {
             if (kernel_copyout(addr, buf, sizeof(buf)) != 0)
                 continue;
+            chunks_scanned++;
+
             for (int i = 0; i <= (int)sizeof(buf) - 10; i += 2) {
                 uint16_t limit;
                 uint64_t base;
@@ -2304,6 +2307,19 @@ cmd_dump_idt(int sock)
                 /* Check if base looks like a kernel VA */
                 if ((base >> 40) != 0xFFFFFF)
                     continue;
+                /* IDT must be 16-byte aligned */
+                if (base & 0xF)
+                    continue;
+                /*
+                 * CRITICAL: Only validate addresses in .data range.
+                 * Reading .text or other HV-protected regions will panic.
+                 */
+                if (base < (uint64_t)kdata_base ||
+                    base >= (uint64_t)kdata_base + 0x4000000)
+                    continue;
+
+                send_response(sock, "  candidate at kdata+0x%lx: base=0x%lx, validating...\n",
+                              (addr + i) - (uint64_t)kdata_base, base);
 
                 /* Validate: read first IDT entry at this base */
                 uint8_t entry[16];
@@ -2323,6 +2339,7 @@ cmd_dump_idt(int sock)
                 }
             }
         }
+        send_response(sock, "  scanned %d chunks\n", chunks_scanned);
         if (!found_idt)
             send_response(sock, "  IDTR not found in .data scan\n");
     }
@@ -2555,6 +2572,12 @@ cmd_find_doreti_iret(int sock)
                 if (limit != 0x0FFF)
                     continue;
                 if ((base >> 40) != 0xFFFFFF)
+                    continue;
+                if (base & 0xF)
+                    continue;
+                /* Only validate addresses in .data range - HV will panic on .text */
+                if (base < (uint64_t)kdata_base ||
+                    base >= (uint64_t)kdata_base + 0x4000000)
                     continue;
 
                 /* Validate first IDT entry */
