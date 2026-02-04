@@ -4124,16 +4124,29 @@ broad_done:
                      * avoid hypervisor trap on direct read. */
                     uint8_t gates[64]; /* first 4 entries */
                     int read_ok = 0;
-                    if (base >= ktext && base < kdata) {
-                        uint64_t paddr;
-                        if (vaddr_to_paddr_quiet(dmap_base, pm_cr3,
-                                                 base, &paddr,
-                                                 NULL) == 0) {
-                            read_ok = (kernel_copyout(
-                                dmap_base + paddr, gates, 64) == 0);
+                    int in_text_range = (base >= ktext && base < kdata);
+                    if (in_text_range) {
+                        uint64_t paddr = 0;
+                        int xlat = vaddr_to_paddr_quiet(dmap_base,
+                            pm_cr3, base, &paddr, NULL);
+                        if (xlat == 0) {
+                            int rc = kernel_copyout(
+                                dmap_base + paddr, gates, 64);
+                            read_ok = (rc == 0);
+                            if (ridt_candidates_rejected < 3)
+                                send_response(sock,
+                                    "  DMAP probe: base=0x%lx "
+                                    "pa=0x%lx rc=%d\n",
+                                    base, paddr, rc);
+                        } else if (ridt_candidates_rejected < 3) {
+                            send_response(sock,
+                                "  xlat fail: base=0x%lx\n", base);
                         }
                     } else {
                         read_ok = (kernel_copyout(base, gates, 64) == 0);
+                        if (!read_ok && ridt_candidates_rejected < 3)
+                            send_response(sock,
+                                "  direct fail: base=0x%lx\n", base);
                     }
                     if (!read_ok) {
                         ridt_candidates_rejected++;
