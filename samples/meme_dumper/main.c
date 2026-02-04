@@ -1193,6 +1193,189 @@ cmd_apic_probe(int sock)
     send_response(sock, "OK\n");
 }
 
+/*
+ * apic_timing - Measure memory access timing using APIC timer
+ * Usage: apic_timing
+ *
+ * Uses the APIC timer (CCR - Current Count Register) to measure
+ * timing differences between accessible and blocked memory regions.
+ * Large timing differences indicate HV intercept overhead.
+ */
+static void
+cmd_apic_timing(int sock)
+{
+    uint64_t dmap_base = get_dmap_base();
+    uint64_t apic_vaddr = dmap_base + DEFAULT_APIC_BASE;
+    uint32_t timer_start, timer_end;
+    uint64_t val;
+    int i;
+
+    #define APIC_CCR_OFFSET 0x390
+    #define NUM_SAMPLES 10
+
+    send_response(sock, "=== APIC Timing Analysis ===\n\n");
+    send_response(sock, "DMAP base: 0x%lx\n", dmap_base);
+    send_response(sock, "APIC CCR @ 0x%lx\n", apic_vaddr + APIC_CCR_OFFSET);
+    send_response(sock, "Samples per test: %d\n\n", NUM_SAMPLES);
+
+    /* Test 1: Time DMAP read of known accessible memory (.data region) */
+    send_response(sock, "=== Test 1: Accessible Memory (DMAP .data) ===\n");
+    uint64_t accessible_pa = 0x1000000;  /* 16MB - known accessible from scan */
+    uint64_t accessible_va = dmap_base + accessible_pa;
+    uint32_t accessible_times[NUM_SAMPLES];
+    uint32_t accessible_total = 0;
+
+    for (i = 0; i < NUM_SAMPLES; i++) {
+        kernel_copyout(apic_vaddr + APIC_CCR_OFFSET, &timer_start, 4);
+        kernel_copyout(accessible_va, &val, 8);
+        kernel_copyout(apic_vaddr + APIC_CCR_OFFSET, &timer_end, 4);
+        accessible_times[i] = timer_start - timer_end;
+        accessible_total += accessible_times[i];
+    }
+    send_response(sock, "PA 0x%lx: ", accessible_pa);
+    for (i = 0; i < NUM_SAMPLES; i++) {
+        send_response(sock, "%u ", accessible_times[i]);
+    }
+    send_response(sock, "\nAverage: %u cycles\n\n", accessible_total / NUM_SAMPLES);
+
+    /* Test 2: Time multiple accessible regions to establish baseline */
+    send_response(sock, "=== Test 2: Multiple Accessible Regions ===\n");
+    uint64_t test_addrs[] = {0x2000000, 0x4000000, 0x8000000, 0xA000000};
+    for (int t = 0; t < 4; t++) {
+        uint64_t test_va = dmap_base + test_addrs[t];
+        uint32_t total = 0;
+        for (i = 0; i < NUM_SAMPLES; i++) {
+            kernel_copyout(apic_vaddr + APIC_CCR_OFFSET, &timer_start, 4);
+            kernel_copyout(test_va, &val, 8);
+            kernel_copyout(apic_vaddr + APIC_CCR_OFFSET, &timer_end, 4);
+            total += timer_start - timer_end;
+        }
+        send_response(sock, "PA 0x%lx: avg %u cycles\n", test_addrs[t], total / NUM_SAMPLES);
+    }
+
+    /* Test 3: Time APIC register reads (known to work) */
+    send_response(sock, "\n=== Test 3: APIC Register Read Timing ===\n");
+    uint32_t apic_total = 0;
+    for (i = 0; i < NUM_SAMPLES; i++) {
+        kernel_copyout(apic_vaddr + APIC_CCR_OFFSET, &timer_start, 4);
+        kernel_copyout(apic_vaddr + 0x020, &val, 4);  /* LAPIC_ID */
+        kernel_copyout(apic_vaddr + APIC_CCR_OFFSET, &timer_end, 4);
+        apic_total += timer_start - timer_end;
+    }
+    send_response(sock, "APIC register read: avg %u cycles\n", apic_total / NUM_SAMPLES);
+
+    /* Test 4: Measure kernel_copyout overhead */
+    send_response(sock, "\n=== Test 4: kernel_copyout Baseline ===\n");
+    uint32_t overhead_total = 0;
+    for (i = 0; i < NUM_SAMPLES; i++) {
+        kernel_copyout(apic_vaddr + APIC_CCR_OFFSET, &timer_start, 4);
+        /* Just two timer reads back-to-back */
+        kernel_copyout(apic_vaddr + APIC_CCR_OFFSET, &timer_end, 4);
+        overhead_total += timer_start - timer_end;
+    }
+    send_response(sock, "Timer read overhead: avg %u cycles\n", overhead_total / NUM_SAMPLES);
+
+    send_response(sock, "\n=== Analysis ===\n");
+    send_response(sock, "Baseline (timer overhead): ~%u cycles\n", overhead_total / NUM_SAMPLES);
+    send_response(sock, "DMAP read adds: ~%u cycles\n",
+                  (accessible_total / NUM_SAMPLES) - (overhead_total / NUM_SAMPLES));
+    send_response(sock, "\nTo detect HV intercepts, compare these with reads to blocked regions.\n");
+    send_response(sock, "Use 'map_xom_boundary' to find blocked region boundaries first.\n");
+    send_response(sock, "OK\n");
+}
+
+/*
+ * map_xom_boundary - Find exact boundaries of XOM-protected memory regions
+ * Usage: map_xom_boundary [start_pa] [end_pa] [granularity]
+ *
+ * Does fine-grained probing to find exact start/end of blocked regions.
+ * Default scans physical memory with 4KB granularity looking for transitions.
+ */
+static void
+cmd_map_xom_boundary(int sock, const char *args)
+{
+    unsigned long start_pa = 0;
+    unsigned long end_pa = 0x10000000;    /* 256MB default */
+    unsigned long granularity = 0x1000;   /* 4KB default */
+    uint64_t dmap_base = get_dmap_base();
+    uint8_t dummy[8];
+    int transitions = 0;
+    int last_accessible = -1;  /* -1 = unknown, 0 = blocked, 1 = accessible */
+
+    sscanf(args, "%lx %lx %lx", &start_pa, &end_pa, &granularity);
+
+    if (granularity < 0x1000) granularity = 0x1000;  /* Minimum 4KB */
+    if (end_pa <= start_pa) {
+        send_response(sock, "Usage: map_xom_boundary [start_pa] [end_pa] [granularity]\n");
+        send_response(sock, "Example: map_xom_boundary 0 10000000 1000\n");
+        return;
+    }
+
+    /* Limit iterations to prevent timeout */
+    unsigned long max_probes = (end_pa - start_pa) / granularity;
+    if (max_probes > 65536) {
+        send_response(sock, "WARNING: Limiting to 65536 probes. Increase granularity.\n");
+        max_probes = 65536;
+    }
+
+    send_response(sock, "=== XOM Boundary Mapping ===\n");
+    send_response(sock, "Range: 0x%lx - 0x%lx\n", start_pa, end_pa);
+    send_response(sock, "Granularity: 0x%lx (%lu KB)\n", granularity, granularity / 1024);
+    send_response(sock, "DMAP base: 0x%lx\n\n", dmap_base);
+    send_response(sock, "Scanning for accessible/blocked transitions...\n\n");
+
+    uint64_t first_blocked = 0, last_blocked = 0;
+    int blocked_count = 0, accessible_count = 0;
+
+    for (uint64_t pa = start_pa; pa < end_pa && transitions < 100; pa += granularity) {
+        uint64_t va = dmap_base + pa;
+        int is_accessible = (kernel_copyout(va, dummy, sizeof(dummy)) == 0);
+
+        if (last_accessible != -1 && is_accessible != last_accessible) {
+            /* Found a transition */
+            if (is_accessible) {
+                send_response(sock, "TRANSITION @ PA 0x%lx: BLOCKED -> ACCESSIBLE\n", pa);
+                last_blocked = pa - granularity;
+            } else {
+                send_response(sock, "TRANSITION @ PA 0x%lx: ACCESSIBLE -> BLOCKED\n", pa);
+                if (first_blocked == 0) first_blocked = pa;
+            }
+            transitions++;
+        }
+
+        if (is_accessible) {
+            accessible_count++;
+        } else {
+            blocked_count++;
+            if (first_blocked == 0) first_blocked = pa;
+            last_blocked = pa;
+        }
+
+        last_accessible = is_accessible;
+    }
+
+    send_response(sock, "\n=== Summary ===\n");
+    send_response(sock, "Probes: accessible=%d, blocked=%d\n", accessible_count, blocked_count);
+    send_response(sock, "Transitions found: %d\n", transitions);
+
+    if (blocked_count > 0) {
+        send_response(sock, "\n=== Blocked Region Estimate ===\n");
+        send_response(sock, "First blocked: PA 0x%lx (DMAP 0x%lx)\n",
+                      first_blocked, dmap_base + first_blocked);
+        send_response(sock, "Last blocked:  PA 0x%lx (DMAP 0x%lx)\n",
+                      last_blocked, dmap_base + last_blocked);
+        send_response(sock, "Approx size:   0x%lx (%lu MB)\n",
+                      last_blocked - first_blocked,
+                      (last_blocked - first_blocked) / (1024 * 1024));
+        send_response(sock, "\nFor finer mapping, run:\n");
+        send_response(sock, "  map_xom_boundary %lx %lx 1000\n",
+                      first_blocked > 0x100000 ? first_blocked - 0x100000 : 0,
+                      last_blocked + 0x100000);
+    }
+
+    send_response(sock, "OK\n");
+}
+
 /* Display kernel information */
 static void
 cmd_kinfo(int sock) {
@@ -1333,6 +1516,12 @@ handle_command(int sock, char *cmd) {
         cmd_probe_dmap(sock, cmd + 11);
     } else if (strcmp(cmd, "apic_probe") == 0) {
         cmd_apic_probe(sock);
+    } else if (strcmp(cmd, "apic_timing") == 0) {
+        cmd_apic_timing(sock);
+    } else if (strcmp(cmd, "map_xom_boundary") == 0) {
+        cmd_map_xom_boundary(sock, "");
+    } else if (strncmp(cmd, "map_xom_boundary ", 17) == 0) {
+        cmd_map_xom_boundary(sock, cmd + 17);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -1355,6 +1544,8 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "msr_dump                 - Find cached MSR values\n");
         send_response(sock, "probe_dmap <start> <end> - Fault-safe DMAP probe\n");
         send_response(sock, "apic_probe               - APIC register analysis\n");
+        send_response(sock, "apic_timing              - Measure memory access timing\n");
+        send_response(sock, "map_xom_boundary [s] [e] - Find XOM region boundaries\n");
         send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
