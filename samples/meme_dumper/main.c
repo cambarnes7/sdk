@@ -4403,7 +4403,6 @@ broad_done:
                     }
                     ridt_probed++;
                     int valid = 0;
-                    int ridt_cs_ok = 0;
                     for (int v = 0; v < 4; v++) {
                         uint8_t *g = gates + v * 16;
                         /* Check present bit + gate type */
@@ -4417,10 +4416,6 @@ broad_done:
                         memcpy(&rsvd, g + 12, 4);
                         if (rsvd != 0)
                             continue;
-                        uint16_t gcs;
-                        memcpy(&gcs, g + 2, 2);
-                        if (gcs != 0)
-                            ridt_cs_ok = 1;
                         /* Check handler is kernel address */
                         uint64_t h = (uint64_t)g[0] |
                                      ((uint64_t)g[1] << 8) |
@@ -4486,7 +4481,6 @@ broad_done:
                          poff + 64 <= 4096 && !idt_found;
                          poff += 16) {
                         int valid = 0;
-                        int any_cs_ok = 0;
                         for (int v = 0; v < 4; v++) {
                             uint8_t *g = page + poff + v * 16;
                             if (!(g[5] & 0x80))
@@ -4498,10 +4492,6 @@ broad_done:
                             memcpy(&rsvd, g + 12, 4);
                             if (rsvd != 0)
                                 continue;
-                            uint16_t gcs;
-                            memcpy(&gcs, g + 2, 2);
-                            if (gcs != 0)
-                                any_cs_ok = 1;
                             uint64_t h = (uint64_t)g[0] |
                                          ((uint64_t)g[1] << 8) |
                                          ((uint64_t)g[6] << 16) |
@@ -4576,7 +4566,6 @@ broad_done:
                     phys_pages_read++;
 
                     int valid = 0;
-                    int any_cs_nonzero = 0;
                     for (int v = 0; v < 4; v++) {
                         uint8_t *g = gates + v * 16;
                         if (!(g[5] & 0x80))
@@ -4588,10 +4577,6 @@ broad_done:
                         memcpy(&rsvd, g + 12, 4);
                         if (rsvd != 0)
                             continue;
-                        uint16_t gate_cs;
-                        memcpy(&gate_cs, g + 2, 2);
-                        if (gate_cs != 0)
-                            any_cs_nonzero = 1;
                         uint64_t h = (uint64_t)g[0] |
                             ((uint64_t)g[1] << 8) |
                             ((uint64_t)g[6] << 16) |
@@ -4648,7 +4633,6 @@ broad_done:
                              poff + 64 <= 4096 && !idt_found;
                              poff += 16) {
                             int valid = 0;
-                            int any_cs_nz = 0;
                             for (int v = 0; v < 4; v++) {
                                 uint8_t *g = page + poff + v * 16;
                                 if (!(g[5] & 0x80))
@@ -4660,10 +4644,6 @@ broad_done:
                                 memcpy(&rsvd, g + 12, 4);
                                 if (rsvd != 0)
                                     continue;
-                                uint16_t gcs;
-                                memcpy(&gcs, g + 2, 2);
-                                if (gcs != 0)
-                                    any_cs_nz = 1;
                                 uint64_t h = (uint64_t)g[0] |
                                     ((uint64_t)g[1] << 8) |
                                     ((uint64_t)g[6] << 16) |
