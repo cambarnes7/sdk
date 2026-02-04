@@ -55,6 +55,7 @@ along with this program; see the file COPYING. If not, see
 #include <ucontext.h>
 #include <sys/cpuset.h>
 #include <pthread.h>
+#include <pthread_np.h>
 
 #include <ps5/kernel.h>
 
@@ -81,6 +82,8 @@ static volatile uint64_t     gp_trap_doreti_addr;
 static volatile uint64_t     gp_trap_mc_cs;
 static volatile uint64_t     gp_trap_mc_err;
 static sigjmp_buf            gp_trap_jmp_env;
+static volatile sig_atomic_t gp_trap_attempt_count;
+static volatile int          gp_trap_sig_received;
 
 /* Server configuration */
 #define SERVER_PORT 9023
@@ -110,8 +113,12 @@ static sigjmp_buf            gp_trap_jmp_env;
 #define PML4SHIFT           39
 
 /* Page sizes for large pages */
+#ifndef NBPDR
 #define NBPDR               (1UL << PDRSHIFT)   /* 2MB */
+#endif
+#ifndef NBPDP
 #define NBPDP               (1UL << PDPSHIFT)   /* 1GB */
+#endif
 
 /* Page table entry flags */
 #define PTE_P               0x001   /* Present */
@@ -2849,16 +2856,16 @@ cmd_dump_idt(int sock)
  * from the signal context's mc_rip.
  */
 
-/* SIGBUS handler for #GP trap frame method */
+/* Signal handler for #GP trap frame method (catches SIGBUS and SIGSEGV) */
 static void
-gp_trap_sigbus_handler(int sig, siginfo_t *info, void *ctx)
+gp_trap_fault_handler(int sig, siginfo_t *info, void *ctx)
 {
-    (void)sig;
     (void)info;
     ucontext_t *uc = (ucontext_t *)ctx;
     gp_trap_doreti_addr = uc->uc_mcontext.mc_rip;
     gp_trap_mc_cs       = uc->uc_mcontext.mc_cs;
     gp_trap_mc_err      = uc->uc_mcontext.mc_err;
+    gp_trap_sig_received = sig;
     gp_trap_got_result  = 1;
     siglongjmp(gp_trap_jmp_env, 1);
 }
@@ -2900,9 +2907,10 @@ gp_trap_writer_fn(void *arg)
  *   - A second TSS follows 104+ bytes later (per-CPU array)
  *
  * Returns the kernel VA of the first TSS, or 0 on failure.
+ * If stride_out is non-NULL, stores the per-CPU TSS stride.
  */
 static uint64_t
-find_tss_in_kdata(int sock)
+find_tss_in_kdata(int sock, int *stride_out)
 {
     uint64_t kdata_base = (uint64_t)KERNEL_ADDRESS_DATA_BASE;
     uint64_t ktext_base = (uint64_t)KERNEL_ADDRESS_TEXT_BASE;
@@ -2972,6 +2980,8 @@ find_tss_in_kdata(int sock)
                     continue;
                 if (next_rsp0 >= (uint64_t)ktext_base && next_rsp0 != 0) {
                     found_second = 1;
+                    if (stride_out)
+                        *stride_out = stride;
                     send_response(sock, "TSS found at 0x%lx (stride=%d to next)\n",
                                   tss_va, stride);
                     break;
@@ -4021,14 +4031,20 @@ broad_done:
         void *ist_page = NULL;
         void *sigalt_stack = NULL;
         uint64_t tss_va = 0;
-        int ist_modified[7] = {0};
-        uint64_t ist_saved[7] = {0};
+        int tss_stride = 0;
+        #define GP_TRAP_MAX_CPUS 8
+        int ist_modified_percpu[GP_TRAP_MAX_CPUS][7];
+        uint64_t ist_saved_percpu[GP_TRAP_MAX_CPUS][7];
+        memset(ist_modified_percpu, 0, sizeof(ist_modified_percpu));
+        memset(ist_saved_percpu, 0, sizeof(ist_saved_percpu));
         int idt_gate_modified = 0;
         uint8_t idt_gate_saved[16];
         int gp_ist_index = 0; /* which IST the #GP gate uses (0 = none) */
         int cpu_pinned = 0;
         int sigbus_installed = 0;
         struct sigaction old_sigbus_act;
+        int sigsegv_installed = 0;
+        struct sigaction old_sigsegv_act;
         int writer_started = 0;
         thrd_t writer_thread;
         stack_t old_sigalt;
@@ -4036,11 +4052,12 @@ broad_done:
 
         /* 7a. Find TSS */
         send_response(sock, "7a. Finding TSS in kernel .data...\n");
-        tss_va = find_tss_in_kdata(sock);
+        tss_va = find_tss_in_kdata(sock, &tss_stride);
         if (tss_va == 0) {
             send_response(sock, "TSS not found, cannot proceed with Step 7\n");
             goto step7_cleanup;
         }
+        send_response(sock, "  TSS stride: %d bytes\n", tss_stride);
 
         /* Read all IST entries from TSS */
         uint64_t ist_entries[7];
@@ -4087,26 +4104,44 @@ broad_done:
         send_response(sock, "  IST page PA=0x%lx, DMAP VA=0x%lx, stack top=0x%lx\n",
                       ist_page_pa, ist_dmap_va, ist_stack_top);
 
-        /* 7e. Save & modify TSS IST entries */
-        send_response(sock, "\n7e. Modifying TSS IST entries...\n");
+        /* 7e. Save & modify TSS IST entries on ALL per-CPU TSSes */
+        send_response(sock, "\n7e. Modifying per-CPU TSS IST entries...\n");
         if (found_idt && gp_ist_index > 0) {
-            /* IDT found and #GP uses a specific IST: modify just that one */
+            /* IDT found and #GP uses a specific IST: modify that IST on all CPUs */
             int idx = gp_ist_index - 1;
-            ist_saved[idx] = ist_entries[idx];
-            kernel_setlong(tss_va + 0x24 + idx * 8, ist_stack_top);
-            ist_modified[idx] = 1;
-            send_response(sock, "  Set IST%d = 0x%lx (was 0x%lx)\n",
-                          gp_ist_index, ist_stack_top, ist_saved[idx]);
+            for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS && tss_stride > 0; cpu++) {
+                uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
+                uint32_t rsvd0;
+                uint64_t rsp0;
+                if (kernel_copyout(cpu_tss, &rsvd0, 4) != 0 || rsvd0 != 0)
+                    break;
+                if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0 || rsp0 == 0)
+                    break;
+                ist_saved_percpu[cpu][idx] = kernel_getlong(cpu_tss + 0x24 + idx * 8);
+                kernel_setlong(cpu_tss + 0x24 + idx * 8, ist_stack_top);
+                ist_modified_percpu[cpu][idx] = 1;
+                send_response(sock, "  CPU%d TSS 0x%lx: IST%d -> 0x%lx (was 0x%lx)\n",
+                              cpu, cpu_tss, gp_ist_index, ist_stack_top,
+                              ist_saved_percpu[cpu][idx]);
+            }
         } else if (found_idt && gp_ist_index == 0) {
-            /* #GP uses IST=0 (current stack); need to set one and modify gate */
+            /* #GP uses IST=0 (current stack); set IST7 on all CPUs + modify gate */
             send_response(sock, "  #GP uses IST=0; setting IST7 and modifying gate\n");
             gp_ist_index = 7;
             int idx = 6; /* IST7 = index 6 */
-            ist_saved[idx] = ist_entries[idx];
-            kernel_setlong(tss_va + 0x24 + idx * 8, ist_stack_top);
-            ist_modified[idx] = 1;
-            send_response(sock, "  Set IST7 = 0x%lx (was 0x%lx)\n",
-                          ist_stack_top, ist_saved[idx]);
+            for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS && tss_stride > 0; cpu++) {
+                uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
+                uint32_t rsvd0;
+                uint64_t rsp0;
+                if (kernel_copyout(cpu_tss, &rsvd0, 4) != 0 || rsvd0 != 0)
+                    break;
+                if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0 || rsp0 == 0)
+                    break;
+                ist_saved_percpu[cpu][idx] = kernel_getlong(cpu_tss + 0x24 + idx * 8);
+                kernel_setlong(cpu_tss + 0x24 + idx * 8, ist_stack_top);
+                ist_modified_percpu[cpu][idx] = 1;
+            }
+            send_response(sock, "  Set IST7 on all CPUs to 0x%lx\n", ist_stack_top);
 
             /* Modify #GP IDT gate byte 4 to use IST7 */
             if (kernel_copyout(idt_base + 13 * 16, idt_gate_saved, 16) == 0) {
@@ -4119,29 +4154,80 @@ broad_done:
                 send_response(sock, "  WARNING: cannot modify #GP gate\n");
             }
         } else {
-            /* IDT not found: set ALL IST1-7 to cover unknown #GP IST */
-            send_response(sock, "  No IDT: setting ALL IST1-7 to our stack\n");
-            for (int i = 0; i < 7; i++) {
-                ist_saved[i] = ist_entries[i];
-                kernel_setlong(tss_va + 0x24 + i * 8, ist_stack_top);
-                ist_modified[i] = 1;
+            /* IDT not found: set ALL IST1-7 on ALL CPUs */
+            send_response(sock, "  No IDT: setting ALL IST1-7 on all CPUs\n");
+            for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS && tss_stride > 0; cpu++) {
+                uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
+                uint32_t rsvd0;
+                uint64_t rsp0;
+                if (kernel_copyout(cpu_tss, &rsvd0, 4) != 0 || rsvd0 != 0)
+                    break;
+                if (kernel_copyout(cpu_tss + 4, &rsp0, 8) != 0 || rsp0 == 0)
+                    break;
+                for (int i = 0; i < 7; i++) {
+                    ist_saved_percpu[cpu][i] = kernel_getlong(cpu_tss + 0x24 + i * 8);
+                    kernel_setlong(cpu_tss + 0x24 + i * 8, ist_stack_top);
+                    ist_modified_percpu[cpu][i] = 1;
+                }
+                send_response(sock, "  CPU%d TSS 0x%lx: all IST1-7 -> 0x%lx\n",
+                              cpu, cpu_tss, ist_stack_top);
             }
-            send_response(sock, "  All IST1-7 set to 0x%lx\n", ist_stack_top);
         }
 
-        /* 7f. Pin to CPU 0 */
+        /* 7f. Pin to CPU 0 (cascading fallback) */
         send_response(sock, "\n7f. Pinning to CPU 0...\n");
         {
             cpuset_t cpuset;
             CPU_ZERO(&cpuset);
             CPU_SET(0, &cpuset);
-            if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+
+            /* Strategy 1: CPU_WHICH_PID with full cpuset_t */
+            if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, getpid(),
                                    sizeof(cpuset), &cpuset) == 0) {
                 cpu_pinned = 1;
-                send_response(sock, "  Pinned to CPU 0\n");
-            } else {
-                send_response(sock, "  WARNING: cpuset_setaffinity failed (errno=%d)\n",
-                              errno);
+                send_response(sock, "  Pinned via CPU_WHICH_PID (size=%zu)\n",
+                              sizeof(cpuset));
+            }
+
+            /* Strategy 2: CPU_WHICH_PID with 8-byte mask */
+            if (!cpu_pinned) {
+                unsigned long small_mask = 1; /* bit 0 = CPU 0 */
+                if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, getpid(),
+                                       sizeof(small_mask),
+                                       (const cpuset_t *)&small_mask) == 0) {
+                    cpu_pinned = 1;
+                    send_response(sock, "  Pinned via small cpuset (8 bytes)\n");
+                } else {
+                    send_response(sock, "  small cpuset failed (errno=%d)\n", errno);
+                }
+            }
+
+            /* Strategy 3: pthread_setaffinity_np */
+            if (!cpu_pinned) {
+                pthread_t self = pthread_self();
+                if (pthread_setaffinity_np(self, sizeof(cpuset), &cpuset) == 0) {
+                    cpu_pinned = 1;
+                    send_response(sock, "  Pinned via pthread_setaffinity_np\n");
+                } else {
+                    send_response(sock, "  pthread_setaffinity_np failed (errno=%d)\n",
+                                  errno);
+                }
+            }
+
+            /* Strategy 4: CPU_WHICH_TID (original) */
+            if (!cpu_pinned) {
+                if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+                                       sizeof(cpuset), &cpuset) == 0) {
+                    cpu_pinned = 1;
+                    send_response(sock, "  Pinned via CPU_WHICH_TID\n");
+                } else {
+                    send_response(sock, "  CPU_WHICH_TID failed (errno=%d)\n", errno);
+                }
+            }
+
+            if (!cpu_pinned) {
+                send_response(sock, "  WARNING: all pinning strategies failed\n");
+                send_response(sock, "  Continuing - all per-CPU TSSes were modified\n");
             }
         }
 
@@ -4170,15 +4256,21 @@ broad_done:
 
             struct sigaction sa;
             memset(&sa, 0, sizeof(sa));
-            sa.sa_sigaction = gp_trap_sigbus_handler;
+            sa.sa_sigaction = gp_trap_fault_handler;
             sigemptyset(&sa.sa_mask);
             sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
             if (sigaction(SIGBUS, &sa, &old_sigbus_act) == 0) {
                 sigbus_installed = 1;
                 send_response(sock, "  SIGBUS handler installed (SA_ONSTACK)\n");
             } else {
-                send_response(sock, "  sigaction failed\n");
+                send_response(sock, "  SIGBUS sigaction failed\n");
                 goto step7_cleanup;
+            }
+            if (sigaction(SIGSEGV, &sa, &old_sigsegv_act) == 0) {
+                sigsegv_installed = 1;
+                send_response(sock, "  SIGSEGV handler installed (SA_ONSTACK)\n");
+            } else {
+                send_response(sock, "  WARNING: SIGSEGV sigaction failed\n");
             }
         }
 
@@ -4196,40 +4288,74 @@ broad_done:
             goto step7_cleanup;
         }
 
-        /* 7i. Trigger loop */
+        /* 7i. Trigger loop
+         *
+         * Use volatile global counter instead of stack-local variable,
+         * because setcontext() restores the stack frame (including any
+         * local 'attempt' variable) back to the getcontext() save point.
+         * The volatile global survives the context restore.
+         *
+         * sigsetjmp is placed OUTSIDE the loop so that siglongjmp from
+         * the signal handler lands here with the counter intact.
+         */
         send_response(sock, "\n7i. Triggering iretq fault (up to 20 attempts)...\n");
         {
             int max_attempts = 20;
+            gp_trap_attempt_count = 0;
+            gp_trap_sig_received = 0;
 
-            for (int attempt = 1; attempt <= max_attempts; attempt++) {
-                if (gp_trap_got_result)
-                    break;
+            if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
+                /* Returned from signal handler via siglongjmp */
+                send_response(sock, "  attempt %d: signal %d (%s) caught! "
+                              "mc_rip=0x%lx mc_cs=0x%lx mc_err=0x%lx\n",
+                              (int)gp_trap_attempt_count,
+                              (int)gp_trap_sig_received,
+                              gp_trap_sig_received == SIGBUS ? "SIGBUS" :
+                              gp_trap_sig_received == SIGSEGV ? "SIGSEGV" : "?",
+                              (uint64_t)gp_trap_doreti_addr,
+                              (uint64_t)gp_trap_mc_cs,
+                              (uint64_t)gp_trap_mc_err);
+            } else {
+                /* Normal path: loop triggering faults */
+                while (!gp_trap_got_result &&
+                       gp_trap_attempt_count < max_attempts) {
+                    /*
+                     * Increment BEFORE getcontext so the counter
+                     * reflects the current attempt even after
+                     * setcontext restores to this point.
+                     */
+                    gp_trap_attempt_count++;
 
-                if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
-                    /* Returned from SIGBUS handler */
-                    send_response(sock, "  attempt %d: SIGBUS caught! "
-                                  "mc_rip=0x%lx mc_cs=0x%lx mc_err=0x%lx\n",
-                                  attempt, (uint64_t)gp_trap_doreti_addr,
-                                  (uint64_t)gp_trap_mc_cs,
-                                  (uint64_t)gp_trap_mc_err);
-                    break;
+                    if ((gp_trap_attempt_count % 5) == 1) {
+                        send_response(sock, "  attempt %d...\n",
+                                      (int)gp_trap_attempt_count);
+                    }
+
+                    /*
+                     * getcontext() saves current context. setcontext()
+                     * restores it, going through kernel iretq with the
+                     * non-canonical RIP -> #GP -> IST stack -> writer
+                     * overwrites CS -> signal delivered with mc_rip =
+                     * doreti_iret.
+                     *
+                     * When setcontext restores to here, getcontext
+                     * "returns" again. The volatile global counter
+                     * lets us detect this and avoid infinite loops.
+                     */
+                    ucontext_t uc;
+                    getcontext(&uc);
+
+                    /* Check after getcontext returns (possibly via setcontext) */
+                    if (gp_trap_got_result)
+                        break;
+                    if (gp_trap_attempt_count > max_attempts)
+                        break;
+
+                    uc.uc_mcontext.mc_rip = 0x8000000000000000ULL;
+                    setcontext(&uc);
+
+                    /* Should not reach here - setcontext doesn't return */
                 }
-
-                /*
-                 * Get current context, set RIP to non-canonical address,
-                 * then setcontext() -> kernel iretq -> #GP because the
-                 * return address is non-canonical.
-                 */
-                ucontext_t uc;
-                getcontext(&uc);
-
-                if (gp_trap_got_result)
-                    break;
-
-                uc.uc_mcontext.mc_rip = 0x8000000000000000ULL;
-                setcontext(&uc);
-
-                /* Should not reach here - setcontext doesn't return on success */
             }
         }
 
@@ -4249,8 +4375,15 @@ broad_done:
                     "Confidence: HIGH (direct trap frame intercept)\n");
                 send_response(sock, "\nNotes:\n");
                 send_response(sock,
-                    "  mc_cs=0x%lx mc_err=0x%lx\n",
+                    "  Signal: %d (%s)  mc_cs=0x%lx mc_err=0x%lx\n",
+                    (int)gp_trap_sig_received,
+                    gp_trap_sig_received == SIGBUS ? "SIGBUS" :
+                    gp_trap_sig_received == SIGSEGV ? "SIGSEGV" : "?",
                     (uint64_t)gp_trap_mc_cs, (uint64_t)gp_trap_mc_err);
+                if (gp_trap_sig_received == SIGSEGV)
+                    send_response(sock,
+                        "  (SIGSEGV indicates kernel handled #GP normally "
+                        "via default IST; IST race still captured mc_rip)\n");
                 send_response(sock,
                     "  Found via sleirsgoevy's IST #GP race technique\n");
                 send_response(sock,
@@ -4264,11 +4397,15 @@ broad_done:
                     writer_started = 0;
                 }
 
-                /* Cleanup TSS */
-                for (int i = 0; i < 7; i++) {
-                    if (ist_modified[i]) {
-                        kernel_setlong(tss_va + 0x24 + i * 8, ist_saved[i]);
-                        ist_modified[i] = 0;
+                /* Cleanup per-CPU TSS IST entries */
+                for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS; cpu++) {
+                    for (int i = 0; i < 7; i++) {
+                        if (ist_modified_percpu[cpu][i]) {
+                            uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
+                            kernel_setlong(cpu_tss + 0x24 + i * 8,
+                                           ist_saved_percpu[cpu][i]);
+                            ist_modified_percpu[cpu][i] = 0;
+                        }
                     }
                 }
                 /* Cleanup IDT gate */
@@ -4281,6 +4418,11 @@ broad_done:
                     sigaction(SIGBUS, &old_sigbus_act, NULL);
                     sigbus_installed = 0;
                 }
+                /* Restore SIGSEGV */
+                if (sigsegv_installed) {
+                    sigaction(SIGSEGV, &old_sigsegv_act, NULL);
+                    sigsegv_installed = 0;
+                }
                 /* Restore sigaltstack */
                 if (had_old_sigalt) {
                     sigaltstack(&old_sigalt, NULL);
@@ -4292,8 +4434,9 @@ broad_done:
                     CPU_ZERO(&all);
                     for (int i = 0; i < 16; i++)
                         CPU_SET(i, &all);
-                    cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+                    cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, getpid(),
                                        sizeof(all), &all);
+                    pthread_setaffinity_np(pthread_self(), sizeof(all), &all);
                     cpu_pinned = 0;
                 }
                 /* Free pages */
@@ -4314,7 +4457,19 @@ broad_done:
                     addr);
             }
         } else {
-            send_response(sock, "  No result after all attempts\n");
+            send_response(sock, "  No result after %d attempts\n",
+                          (int)gp_trap_attempt_count);
+            if (gp_trap_sig_received)
+                send_response(sock, "  Last signal received: %d (%s)\n",
+                              (int)gp_trap_sig_received,
+                              gp_trap_sig_received == SIGBUS ? "SIGBUS" :
+                              gp_trap_sig_received == SIGSEGV ? "SIGSEGV" : "?");
+            else
+                send_response(sock,
+                    "  No signal received at all — possible causes:\n"
+                    "    - Thread running on CPU whose TSS was not modified\n"
+                    "    - Writer thread timing issue\n"
+                    "    - Kernel handles #GP without delivering signal\n");
         }
 
     step7_cleanup:
@@ -4327,12 +4482,17 @@ broad_done:
             writer_started = 0;
         }
 
-        /* Restore TSS IST entries */
-        for (int i = 0; i < 7; i++) {
-            if (ist_modified[i]) {
-                kernel_setlong(tss_va + 0x24 + i * 8, ist_saved[i]);
-                send_response(sock, "  Restored IST%d to 0x%lx\n",
-                              i + 1, ist_saved[i]);
+        /* Restore per-CPU TSS IST entries */
+        for (int cpu = 0; cpu < GP_TRAP_MAX_CPUS; cpu++) {
+            for (int i = 0; i < 7; i++) {
+                if (ist_modified_percpu[cpu][i]) {
+                    uint64_t cpu_tss = tss_va + (uint64_t)cpu * tss_stride;
+                    kernel_setlong(cpu_tss + 0x24 + i * 8,
+                                   ist_saved_percpu[cpu][i]);
+                    if (cpu == 0) /* only log CPU0 to avoid spam */
+                        send_response(sock, "  Restored CPU%d IST%d to 0x%lx\n",
+                                      cpu, i + 1, ist_saved_percpu[cpu][i]);
+                }
             }
         }
 
@@ -4346,6 +4506,10 @@ broad_done:
         if (sigbus_installed)
             sigaction(SIGBUS, &old_sigbus_act, NULL);
 
+        /* Restore SIGSEGV handler */
+        if (sigsegv_installed)
+            sigaction(SIGSEGV, &old_sigsegv_act, NULL);
+
         /* Restore sigaltstack */
         if (had_old_sigalt)
             sigaltstack(&old_sigalt, NULL);
@@ -4356,8 +4520,9 @@ broad_done:
             CPU_ZERO(&all);
             for (int i = 0; i < 16; i++)
                 CPU_SET(i, &all);
-            cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1,
+            cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, getpid(),
                                sizeof(all), &all);
+            pthread_setaffinity_np(pthread_self(), sizeof(all), &all);
         }
 
         /* Free pages */
