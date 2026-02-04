@@ -1803,6 +1803,145 @@ cmd_scan_apic_ops(int sock, const char *args)
     send_response(sock, "OK\n");
 }
 
+/*
+ * identify_table - Dump detailed context around a function pointer table
+ * Usage: identify_table <va> [context_bytes]
+ *
+ * Shows hex+ASCII dump before/after, pointer spread analysis,
+ * and nearby printable strings to help identify the structure.
+ */
+static void
+cmd_identify_table(int sock, const char *args)
+{
+    unsigned long va;
+    int context = 128;
+
+    if (!args || sscanf(args, "%lx %d", &va, &context) < 1) {
+        send_response(sock, "Usage: identify_table <va> [context_bytes]\n");
+        send_response(sock, "  va  - virtual address of table (from scan_apic_ops)\n");
+        send_response(sock, "  ctx - bytes before/after to show (default 128, max 512)\n");
+        return;
+    }
+    if (context < 32) context = 32;
+    if (context > 512) context = 512;
+
+    intptr_t ktext_base = KERNEL_ADDRESS_TEXT_BASE;
+    intptr_t kdata_base = KERNEL_ADDRESS_DATA_BASE;
+    uint64_t text_start = (uint64_t)ktext_base;
+    uint64_t text_end = text_start + 0x1000000;
+
+    /* 1. Count table entries (consecutive .text pointers at va) */
+    int num_ptrs = 0;
+    uint64_t ptrs[32];
+    for (int i = 0; i < 32; i++) {
+        uint64_t val;
+        if (kernel_copyout(va + i * 8, &val, 8) != 0) break;
+        if (val >= text_start && val < text_end) {
+            ptrs[i] = val;
+            num_ptrs++;
+        } else {
+            break;
+        }
+    }
+
+    uint64_t kdata_off = (uint64_t)va - (uint64_t)kdata_base;
+    send_response(sock, "=== Table at VA 0x%lx (kdata+0x%lx) ===\n", va, kdata_off);
+    send_response(sock, "Consecutive .text pointers: %d\n\n", num_ptrs);
+
+    /* 2. Dump pre-table context (hex + ASCII) */
+    send_response(sock, "--- %d bytes BEFORE table ---\n", context);
+    uint8_t buf[512];
+    if (kernel_copyout(va - context, buf, context) == 0) {
+        for (int i = 0; i < context; i += 16) {
+            send_response(sock, "  %+5d: ", i - context);
+            for (int j = 0; j < 16 && (i + j) < context; j++)
+                send_response(sock, "%02x ", buf[i + j]);
+            send_response(sock, " |");
+            for (int j = 0; j < 16 && (i + j) < context; j++) {
+                char c = buf[i + j];
+                send_response(sock, "%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+            }
+            send_response(sock, "|\n");
+        }
+    } else {
+        send_response(sock, "  (read failed)\n");
+    }
+
+    /* 3. Dump table entries with analysis */
+    send_response(sock, "\n--- Table entries ---\n");
+    uint64_t min_off = UINT64_MAX, max_off = 0;
+    for (int i = 0; i < num_ptrs; i++) {
+        uint64_t off = ptrs[i] - text_start;
+        if (off < min_off) min_off = off;
+        if (off > max_off) max_off = off;
+        send_response(sock, "  [%2d] 0x%lx  (ktext+0x%lx)\n", i, ptrs[i], off);
+    }
+
+    /* 4. Dump post-table context */
+    send_response(sock, "\n--- %d bytes AFTER table ---\n", context);
+    if (kernel_copyout(va + num_ptrs * 8, buf, context) == 0) {
+        for (int i = 0; i < context; i += 16) {
+            send_response(sock, "  %+5d: ", num_ptrs * 8 + i);
+            for (int j = 0; j < 16 && (i + j) < context; j++)
+                send_response(sock, "%02x ", buf[i + j]);
+            send_response(sock, " |");
+            for (int j = 0; j < 16 && (i + j) < context; j++) {
+                char c = buf[i + j];
+                send_response(sock, "%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+            }
+            send_response(sock, "|\n");
+        }
+    } else {
+        send_response(sock, "  (read failed)\n");
+    }
+
+    /* 5. Pointer spread analysis */
+    send_response(sock, "\n--- Analysis ---\n");
+    if (num_ptrs > 0) {
+        send_response(sock, "Pointer range: ktext+0x%lx - ktext+0x%lx\n", min_off, max_off);
+        send_response(sock, "Spread: 0x%lx (%lu bytes)\n", max_off - min_off, max_off - min_off);
+        send_response(sock, "Table size: %d entries (%d bytes)\n", num_ptrs, num_ptrs * 8);
+
+        /* Heuristic match for apic_ops */
+        if (num_ptrs >= 10 && num_ptrs <= 16 && (max_off - min_off) < 0x1000) {
+            send_response(sock, "\n** STRONG apic_ops candidate **\n");
+            send_response(sock, "Matches: 10-16 ptrs, tightly clustered (<4KB spread)\n");
+        }
+    } else {
+        send_response(sock, "No .text pointers found at this address.\n");
+    }
+
+    /* 6. Search for printable strings in wider context (512 bytes around) */
+    send_response(sock, "\n--- Nearby strings (512B scan) ---\n");
+    uint8_t wide[512];
+    int found_strings = 0;
+    if (kernel_copyout(va - 256, wide, 512) == 0) {
+        for (int i = 0; i < 512; ) {
+            if (wide[i] >= 0x20 && wide[i] < 0x7f) {
+                int start = i;
+                while (i < 512 && wide[i] >= 0x20 && wide[i] < 0x7f) i++;
+                int len = i - start;
+                if (len >= 4) {
+                    found_strings++;
+                    send_response(sock, "  offset %+d: \"", start - 256);
+                    for (int j = start; j < start + len && j < start + 64; j++)
+                        send_response(sock, "%c", wide[j]);
+                    if (len > 64)
+                        send_response(sock, "...");
+                    send_response(sock, "\"\n");
+                }
+            } else {
+                i++;
+            }
+        }
+    }
+    if (found_strings == 0) {
+        send_response(sock, "  (no printable strings found)\n");
+    }
+
+    send_response(sock, "OK\n");
+}
+
 /* Display kernel information */
 static void
 cmd_kinfo(int sock) {
@@ -1959,6 +2098,8 @@ handle_command(int sock, char *cmd) {
         cmd_scan_apic_ops(sock, "");
     } else if (strncmp(cmd, "scan_apic_ops ", 14) == 0) {
         cmd_scan_apic_ops(sock, cmd + 14);
+    } else if (strncmp(cmd, "identify_table ", 15) == 0) {
+        cmd_identify_table(sock, cmd + 15);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         send_response(sock, "Goodbye!\n");
         return -1;
@@ -1987,6 +2128,7 @@ handle_command(int sock, char *cmd) {
         send_response(sock, "timing_boundary          - Time reads at XOM boundary\n");
         send_response(sock, "verify_xom               - Verify XOM boundaries + APIC state\n");
         send_response(sock, "scan_apic_ops [min]      - Find function pointer tables\n");
+        send_response(sock, "identify_table <va> [ctx] - Identify function ptr table\n");
         send_response(sock, "\nexit                     - Close connection\n");
         send_response(sock, "help                     - Show this help\n");
     } else {
