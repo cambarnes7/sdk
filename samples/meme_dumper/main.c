@@ -5191,7 +5191,7 @@ broad_done:
          * DMAP mapping and the kernel text mapping go through different
          * page table entries, so different permissions are possible.
          */
-        if (gp_handler_va != 0) {
+        if (gp_handler_va != 0 && !text_dmap_xom) {
             usleep(10000); /* 10ms breather before kernel VA read */
             send_response(sock, "\n7b+. Strategy C: kernel VA text "
                           "read test...\n");
@@ -5329,6 +5329,10 @@ broad_done:
                 send_response(sock, "  .text is XOM via kernel VA too — "
                               "Strategy C failed\n");
             }
+        } else if (gp_handler_va != 0 && text_dmap_xom) {
+            send_response(sock, "\n7b+. Strategy C: skipped — "
+                          "DMAP confirmed .text is XOM, kernel VA read "
+                          "would also panic\n");
         }
 
         /* 7c. Allocate IST page */
